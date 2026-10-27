@@ -3,7 +3,9 @@ import type { ReactNode } from 'react'
 import type { BrowserQRCodeReader as BrowserQRCodeReaderType, IScannerControls } from '@zxing/browser'
 import { api, ApiError, json, patch } from './api'
 import { getAuthState, restoreAuthSession } from './auth-session.js'
-import { exchangeSnapshotChanged, refreshPaymentStatus } from './exchange-state.js'
+import { exchangeSnapshotChanged, isPaymentReadyExchange, refreshPaymentStatus } from './exchange-state.js'
+import { fetchAvailableListings } from './listing-feed.js'
+import { matchAndNavigate } from './match-flow.js'
 import { detectCurrentLocation, saveManualLocation } from './location.js'
 import type { ResolvedLocation } from './location.js'
 import { parseUpiPayload } from './upi.js'
@@ -317,7 +319,7 @@ export default function App() {
         {screen === 'student' && selectedListing && <StudentPage listing={selectedListing} navigate={navigate} setChatTarget={setChatTarget} setError={setError}/>}
         {screen === 'chats' && <ChatsPage targetUserId={chatTarget} user={user} setChatTarget={setChatTarget} setError={setError}/>}
         {screen === 'scan' && <ScannerPage user={user} exchangesAction={setSelectedExchange} navigate={navigate} payment={payment} setPayment={setPayment} setError={setError}/>}
-        {screen === 'transactions' && <TransactionsPage navigate={navigate} setSelectedExchange={setSelectedExchange}/>}
+        {screen === 'transactions' && <TransactionsPage coordinates={geoCoordinates} navigate={navigate} setSelectedListing={setSelectedListing} setSelectedExchange={setSelectedExchange}/>}
         {screen === 'meetup' && <MeetupPage user={user} selected={selectedExchange} setSelected={setSelectedExchange} navigate={navigate} setError={setError}/>}
         {screen === 'payment' && payment && <PaymentPage payment={payment} setPayment={setPayment} navigate={navigate}/>}
         {screen === 'notifications' && <NotificationsPage onRead={() => setUnreadCount((count) => Math.max(0, count - 1))}/>}
@@ -360,10 +362,8 @@ function HomePage({ user, locationLabel, geoLabel, geoStatus, geoMessage, coordi
   const [retry, setRetry] = useState(0)
   const load = useCallback(async () => {
     try {
-      const query = new URLSearchParams()
-      if (coordinates) { query.set('latitude', String(coordinates.latitude)); query.set('longitude', String(coordinates.longitude)); query.set('radius_km', '25') }
-      const [nearby, own, activity] = await Promise.all([api(`/api/listings${query.size ? `?${query}` : ''}`), api('/api/my-listings'), api('/api/exchanges')])
-      setListings(nearby.listings.slice(0, 3)); setMine(own.listings.filter((item: any) => item.status !== 'cancelled')); setExchanges(activity.exchanges.slice(0, 2)); setLoadError('')
+      const [available, own, activity] = await Promise.all([fetchAvailableListings<Listing>(api, coordinates), api('/api/my-listings'), api('/api/exchanges')])
+      setListings(available.slice(0, 3)); setMine(own.listings.filter((item: any) => item.status !== 'cancelled')); setExchanges(activity.exchanges.slice(0, 2)); setLoadError('')
     } catch (failure) { setLoadError(failure instanceof Error ? failure.message : 'Could not load your ONPay activity.') } finally { setLoading(false) }
   }, [coordinates, retry])
   useEffect(() => { load() }, [load])
@@ -435,6 +435,8 @@ function MatchesPage({ coordinates, geoStatus, navigate, setSelectedListing, set
   const [loadError, setLoadError] = useState('')
   const [retry, setRetry] = useState(0)
   const [busyId, setBusyId] = useState('')
+  const [matchFailure, setMatchFailure] = useState<{ listingId: string; message: string } | null>(null)
+  const matching = useRef(false)
   const [sort, setSort] = useState('recent')
   const load = useCallback(async () => {
     setLoading(true); setLoadError('')
@@ -451,20 +453,26 @@ function MatchesPage({ coordinates, geoStatus, navigate, setSelectedListing, set
   useEffect(() => { load() }, [load])
   const ordered = useMemo(() => [...listings].sort((a, b) => sort === 'amount' ? a.amount_min - b.amount_min : 0), [listings, sort])
   const match = async (listing: Listing) => {
+    if (matching.current) return
     const expectedKind = listing.kind === 'need' ? 'have' : 'need'
     const ownListing = mine.find((item) => item.kind === expectedKind && Math.max(item.amount_min, listing.amount_min) <= Math.min(item.amount_max, listing.amount_max))
     if (!ownListing) { setError(`Create an active ${expectedKind === 'have' ? 'cash offer' : 'cash request'} with a compatible amount first.`); navigate(expectedKind); return }
     const amount = Math.max(ownListing.amount_min, listing.amount_min)
-    setBusyId(listing.id); setError('')
-    try { const data = await api(`/api/listings/${listing.id}/accept`, json({ amount })); setSelectedExchange(data.exchange); navigate('meetup') }
-    catch (failure) { setError(failure instanceof Error ? failure.message : 'This match is no longer available') }
-    finally { setBusyId('') }
+    matching.current = true
+    setBusyId(listing.id); setError(''); setMatchFailure(null)
+    try {
+      await matchAndNavigate(api, listing.id, amount, setSelectedExchange, navigate, () => { void load() })
+    } catch (failure) {
+      const message = failure instanceof Error ? failure.message : 'This match is no longer available'
+      setError(message); setMatchFailure({ listingId: listing.id, message })
+    } finally { matching.current = false; setBusyId('') }
   }
   return <div className="page-stack"><PageTitle title="Nearby matches" subtitle={coordinates ? 'Active listings within 25 km of your approximate current area.' : geoStatus === 'denied' ? 'Location is blocked; browse all listings or choose a campus area.' : 'Enable location to filter by distance, or browse all active listings.'}/>
     <div className="filter-row">{[['all', 'All'], ['need', 'Need cash'], ['have', 'Have cash']].map(([value, label]) => <button key={value} className={`filter-chip ${filter === value ? 'selected' : ''}`} onClick={() => setFilter(value)}>{label}</button>)}</div>
     <form className="match-filter-panel" onSubmit={(event) => { event.preventDefault(); setFilters({ ...draft }) }}><label>Minimum ₹<input type="number" min="1" step="1" value={draft.minimum} onChange={(event) => setDraft({ ...draft, minimum: event.target.value })} placeholder="Any"/></label><label>Maximum ₹<input type="number" min="1" step="1" value={draft.maximum} onChange={(event) => setDraft({ ...draft, maximum: event.target.value })} placeholder="Any"/></label><label>Campus or area<input maxLength={120} value={draft.location} onChange={(event) => setDraft({ ...draft, location: event.target.value })} placeholder="Any meeting area"/></label><label>Preferred time<input maxLength={80} value={draft.availability} onChange={(event) => setDraft({ ...draft, availability: event.target.value })} placeholder="Any time"/></label><button className="button button-soft">Apply filters</button><button type="button" className="text-action" onClick={() => { const clear = { minimum: '', maximum: '', location: '', availability: '' }; setDraft(clear); setFilters(clear) }}>Clear</button></form>
     <div className="sort-row"><span>{listings.length} {listings.length === 1 ? 'listing' : 'listings'}</span><label>Sort <select value={sort} onChange={(e) => setSort(e.target.value)}><option value="recent">Recently posted</option><option value="amount">Amount</option></select></label></div>
-    {loading ? <div className="loading-inline"><span className="spinner"/>Finding matches…</div> : loadError ? <p className="inline-error" role="alert">{loadError} <button className="text-action" onClick={() => setRetry((value) => value + 1)}>Try again</button></p> : ordered.length ? <div className="match-list">{ordered.map((listing) => <article key={listing.id} className="match-card"><ListingCard listing={listing} onClick={() => { setSelectedListing(listing); navigate('student') }}/><div className="match-detail"><span><Icon name="clock" size={15}/> {listing.availability}</span><span><Icon name="pin" size={15}/> {listing.location}</span></div><div className="match-buttons"><button className="button button-soft" onClick={() => { setSelectedListing(listing); navigate('student') }}>View details</button><button className="button button-primary" disabled={busyId === listing.id} onClick={() => match(listing)}>{busyId === listing.id ? 'Matching…' : 'Match'}</button></div></article>)}</div> : <EmptyState title="No matching listings" body="Try another filter or publish a request or offer so students can find you." action={<div className="empty-actions"><button className="button button-primary" onClick={() => navigate('need')}>I need cash</button><button className="button button-soft" onClick={() => navigate('have')}>I have cash</button></div>}/>}
+    {matchFailure && <p className="inline-error" role="alert">{matchFailure.message} <button className="text-action" disabled={busyId !== ''} onClick={() => { const listing = ordered.find((item) => item.id === matchFailure.listingId); if (listing) void match(listing) }}>Retry match</button></p>}
+    {loading ? <div className="loading-inline"><span className="spinner"/>Finding matches…</div> : loadError ? <p className="inline-error" role="alert">{loadError} <button className="text-action" onClick={() => setRetry((value) => value + 1)}>Try again</button></p> : ordered.length ? <div className="match-list">{ordered.map((listing) => <article key={listing.id} className="match-card"><ListingCard listing={listing} onClick={() => { setSelectedListing(listing); navigate('student') }}/><div className="match-detail"><span><Icon name="clock" size={15}/> {listing.availability}</span><span><Icon name="pin" size={15}/> {listing.location}</span></div><div className="match-buttons"><button className="button button-soft" onClick={() => { setSelectedListing(listing); navigate('student') }}>View details</button><button className="button button-primary" disabled={busyId !== ''} onClick={() => match(listing)}>{busyId === listing.id ? 'Matching…' : 'Match'}</button></div></article>)}</div> : <EmptyState title="No matching listings" body="Try another filter or publish a request or offer so students can find you." action={<div className="empty-actions"><button className="button button-primary" onClick={() => navigate('need')}>I need cash</button><button className="button button-soft" onClick={() => navigate('have')}>I have cash</button></div>}/>}
   </div>
 }
 
@@ -540,7 +548,7 @@ function ScannerPage({ user, exchangesAction, navigate, payment, setPayment, set
   useEffect(() => {
     let active = true
     setExchangeLoading(true); setExchangeLoadError('')
-    api('/api/exchanges').then((data) => { if (active) { const available = data.exchanges.filter((exchange: Exchange) => exchange.status === 'meetup_confirmed' && exchange.requester_arrived && exchange.provider_arrived); setExchanges(available); if (available.length === 1) setExchangeId(available[0].id) } }).catch((failure) => { if (active) setExchangeLoadError(failure instanceof Error ? failure.message : 'Could not load exchanges for payment.') }).finally(() => { if (active) setExchangeLoading(false) })
+    api('/api/exchanges').then((data) => { if (active) { const available = data.exchanges.filter(isPaymentReadyExchange); setExchanges(available); if (available.length === 1) setExchangeId(available[0].id) } }).catch((failure) => { if (active) setExchangeLoadError(failure instanceof Error ? failure.message : 'Could not load exchanges for payment.') }).finally(() => { if (active) setExchangeLoading(false) })
     return () => { active = false }
   }, [exchangeRetry])
   const stopCamera = () => {
@@ -674,7 +682,7 @@ function PaymentPage({ payment, setPayment, navigate }: { payment: Payment; setP
   return <div className="page-stack payment-page"><button className="back-link" onClick={() => navigate('transactions')}><Icon name="back" size={17}/> Transactions</button><section className="payment-status-card"><div className={`status-illustration ${pending ? 'pending' : completed ? 'success' : ''}`}><Icon name={completed ? 'check' : pending ? 'clock' : 'qr'} size={32}/></div><span className="eyebrow">{success ? 'PAYMENT VERIFIED' : receiverConfirmed ? 'RECIPIENT CONFIRMED' : failed ? 'PAYMENT FAILED' : pending ? 'VERIFICATION PENDING' : 'PAYMENT INITIATED'}</span><h1>{money(payment.amount)}</h1><p>{success ? 'This payment was independently reconciled.' : receiverConfirmed ? 'The recipient confirmed receipt after checking their UPI app or bank account. This is not independent bank verification.' : failed ? 'This attempt was marked failed by a configured provider.' : pending ? 'We have not verified that the payment reached the recipient.' : 'Complete the payment in your UPI app, then return here.'}</p><div className="reference-block"><small>ONPay reference</small><strong>{payment.reference}</strong></div>{paymentStatus === 'payment_initiated' && <a className="button button-primary button-wide" href={payment.upi_uri} onClick={launchUpiApp}>Open UPI app <Icon name="arrow"/></a>}{launchMessage && <p className="inline-error" role="status">{launchMessage}</p>}{refreshError && <p className="inline-error" role="alert">{refreshError} The displayed status is the last status confirmed by ONPay.</p>}{!completed && <button className="button button-soft button-wide" onClick={refresh} disabled={loading}>{loading ? 'Checking…' : paymentStatus === 'payment_initiated' ? 'I’m back in ONPay' : 'Refresh status'}</button>}{completed && <button className="button button-primary button-wide" onClick={() => { setPayment(null); navigate('meetup') }}>View exchange <Icon name="arrow"/></button>}<div className="inline-callout"><Icon name="info" size={17}/>{payment.verification_note || 'Returning from a payment app does not verify settlement.'}</div></section>{!completed && <button className="text-action centered" onClick={() => { setPayment(null); navigate('meetup') }}>View meetup details <Icon name="arrow" size={15}/></button>}</div>
 }
 
-function TransactionsPage({ navigate, setSelectedExchange }: { navigate: (screen: Screen) => void; setSelectedExchange: (exchange: Exchange) => void }) {
+function TransactionsPage({ coordinates, navigate, setSelectedListing, setSelectedExchange }: { coordinates: Coordinates | null; navigate: (screen: Screen) => void; setSelectedListing: (listing: Listing) => void; setSelectedExchange: (exchange: Exchange) => void }) {
   const [filter, setFilter] = useState('all')
   const [items, setItems] = useState<Exchange[]>([])
   const [loading, setLoading] = useState(true)
@@ -684,18 +692,72 @@ function TransactionsPage({ navigate, setSelectedExchange }: { navigate: (screen
   const [retry, setRetry] = useState(0)
   const [nextOffset, setNextOffset] = useState(0)
   const [hasMore, setHasMore] = useState(false)
+  const [availableListings, setAvailableListings] = useState<Listing[]>([])
+  const [ownListings, setOwnListings] = useState<Listing[]>([])
+  const [listingsLoading, setListingsLoading] = useState(true)
+  const [listingsError, setListingsError] = useState('')
+  const [listingsRetry, setListingsRetry] = useState(0)
+  const [matchingId, setMatchingId] = useState('')
+  const [matchFailureId, setMatchFailureId] = useState('')
+  const [matchError, setMatchError] = useState('')
+  const [listingSetupKind, setListingSetupKind] = useState<'need' | 'have' | null>(null)
+  const matching = useRef(false)
   useEffect(() => {
     let alive = true
     setLoading(true); setLoadError(''); setItems([]); setNextOffset(0); setHasMore(false)
     api(`/api/transactions?status_filter=${filter}&offset=0&limit=30`).then((data) => { if (alive) { setItems(data.transactions); setNextOffset(data.next_offset); setHasMore(data.has_more); setLoadError('') } }).catch((failure) => { if (alive) setLoadError(failure instanceof Error ? failure.message : 'Could not load transactions.') }).finally(() => { if (alive) setLoading(false) })
     return () => { alive = false }
   }, [filter, retry])
+  useEffect(() => {
+    let alive = true
+    setListingsLoading(true); setListingsError('')
+    Promise.all([fetchAvailableListings<Listing>(api, coordinates), api('/api/my-listings')])
+      .then(([available, own]) => {
+        if (alive) {
+          setAvailableListings(available)
+          setOwnListings(own.listings.filter((listing: Listing) => listing.status === 'active'))
+        }
+      })
+      .catch((failure) => {
+        if (alive) setListingsError(failure instanceof Error ? failure.message : 'Could not load available listings.')
+      })
+      .finally(() => { if (alive) setListingsLoading(false) })
+    return () => { alive = false }
+  }, [coordinates, listingsRetry])
   const loadMore = async () => { setLoadingMore(true); setLoadMoreError(''); try { const data = await api(`/api/transactions?status_filter=${filter}&offset=${nextOffset}&limit=30`); setItems((current) => [...current, ...data.transactions]); setNextOffset(data.next_offset); setHasMore(data.has_more) } catch (failure) { setLoadMoreError(failure instanceof Error ? failure.message : 'Could not load more transactions.') } finally { setLoadingMore(false) } }
   const open = (exchange: Exchange) => { setSelectedExchange(exchange); navigate('meetup') }
+  const match = async (listing: Listing) => {
+    if (matching.current) return
+    const expectedKind = listing.kind === 'need' ? 'have' : 'need'
+    const ownListing = ownListings.find((item) => item.kind === expectedKind && Math.max(item.amount_min, listing.amount_min) <= Math.min(item.amount_max, listing.amount_max))
+    if (!ownListing) {
+      setListingSetupKind(expectedKind)
+      setMatchError(`Create a compatible active ${expectedKind === 'have' ? 'cash offer' : 'cash request'} before matching.`)
+      return
+    }
+    matching.current = true
+    setMatchingId(listing.id); setMatchFailureId(''); setMatchError(''); setListingSetupKind(null)
+    try {
+      await matchAndNavigate(api, listing.id, Math.max(ownListing.amount_min, listing.amount_min), setSelectedExchange, navigate, () => {
+        void fetchAvailableListings<Listing>(api, coordinates)
+          .then(setAvailableListings)
+          .catch((failure) => setListingsError(failure instanceof Error ? failure.message : 'Could not refresh available listings.'))
+      })
+    } catch (failure) {
+      setMatchFailureId(listing.id)
+      setMatchError(failure instanceof Error ? failure.message : 'Could not match this listing. Please try again.')
+    } finally { matching.current = false; setMatchingId('') }
+  }
   const statusLabel = (item: Exchange) => item.status === 'success' ? 'Bank/provider verified' : item.status === 'receiver_confirmed' ? 'Completed · recipient confirmed' : item.payment_status === 'receiver_confirmed' ? 'Recipient confirmed · handover pending' : item.status.replaceAll('_', ' ')
   return (
     <div className="page-stack">
       <PageTitle title="Transactions" subtitle="A record of exchanges and their separate payment states."/>
+      <section className="section-block activity-listings">
+        <div className="section-title"><div><h2>Available requests & offers</h2><p>Active listings you can still match with.</p></div><button className="text-action" onClick={() => setListingsRetry((value) => value + 1)} disabled={listingsLoading}>Refresh</button></div>
+        {listingsError && <p className="inline-error" role="alert">{listingsError} <button className="text-action" onClick={() => setListingsRetry((value) => value + 1)}>Try again</button></p>}
+        {matchError && <p className="inline-error" role="alert">{matchError} {listingSetupKind ? <button className="text-action" onClick={() => navigate(listingSetupKind)}>Create listing</button> : matchFailureId ? <button className="text-action" disabled={matchingId !== ''} onClick={() => { const listing = availableListings.find((item) => item.id === matchFailureId); if (listing) void match(listing) }}>Retry match</button> : null}</p>}
+        {listingsLoading ? <div className="loading-inline"><span className="spinner"/>Loading available listings…</div> : listingsError ? null : availableListings.length ? <div className="match-list">{availableListings.map((listing) => <article key={listing.id} className="match-card"><ListingCard listing={listing} onClick={() => { setSelectedListing(listing); navigate('student') }}/><div className="match-buttons"><button className="button button-soft" onClick={() => { setSelectedListing(listing); navigate('student') }}>View details</button><button className="button button-primary" disabled={matchingId !== ''} onClick={() => void match(listing)}>{matchingId === listing.id ? 'Matching…' : 'Match'}</button></div></article>)}</div> : <EmptyState title="No available requests or offers" body="Only active listings that are still eligible for matching appear here." action={<button className="button button-soft" onClick={() => navigate('matches')}>Browse listings</button>}/>}
+      </section>
       <div className="filter-row status-filters">{[['all', 'All'], ['success', 'Completed'], ['in_transit', 'In transit'], ['failed', 'Failed']].map(([key, label]) => <button key={key} className={`filter-chip ${filter === key ? 'selected' : ''}`} onClick={() => setFilter(key)}>{label}</button>)}</div>
       {loadError && <p className="inline-error" role="alert">{loadError} <button className="text-action" onClick={() => setRetry((value) => value + 1)}>Try again</button></p>}
       {loading ? (

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { exchangeSnapshotChanged, refreshPaymentStatus } from '../src/exchange-state.js'
+import { exchangeSnapshotChanged, isPaymentReadyExchange, refreshPaymentStatus } from '../src/exchange-state.js'
 
 const exchange = (overrides = {}) => ({
   id: 'exchange-1',
@@ -24,6 +24,18 @@ test('keeps an unchanged selected exchange snapshot stable', () => {
 test('refreshes when identity or another visible state changes', () => {
   assert.equal(exchangeSnapshotChanged(exchange(), exchange({ id: 'exchange-2' })), true)
   assert.equal(exchangeSnapshotChanged(exchange(), exchange({ requester_cash_confirmed: true })), true)
+})
+
+test('allows the original UPI flow to resume for a pending payment', () => {
+  for (const status of ['meetup_confirmed', 'payment_initiated', 'verification_pending']) {
+    assert.equal(isPaymentReadyExchange(exchange({
+      status,
+      requester_arrived: true,
+      provider_arrived: true,
+    })), true)
+  }
+  assert.equal(isPaymentReadyExchange(exchange({ status: 'awaiting_meetup', requester_arrived: true, provider_arrived: true })), false)
+  assert.equal(isPaymentReadyExchange(exchange({ status: 'payment_initiated', requester_arrived: true, provider_arrived: false })), false)
 })
 
 test('uses the server status even if recording the app return fails', async () => {
