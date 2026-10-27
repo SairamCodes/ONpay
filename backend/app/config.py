@@ -15,13 +15,9 @@ class Settings(BaseSettings):
     otp_resend_seconds: int = 30
     otp_max_attempts: int = 5
     dev_otp_mode: bool = False
-    smtp_host: str = ""
-    smtp_port: int = 587
-    smtp_username: str = ""
-    smtp_password: str = ""
-    smtp_from: str = ""
-    smtp_starttls: bool = True
-    smtp_use_ssl: bool = False
+    email_provider: Literal["resend"] = "resend"
+    resend_api_key: str = ""
+    email_from: str = ""
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
     twilio_verify_service_sid: str = ""

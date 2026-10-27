@@ -6,7 +6,6 @@ import logging
 import math
 import re
 import secrets
-import smtplib
 import threading
 import time
 import urllib.error
@@ -14,10 +13,10 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from email.message import EmailMessage
 from email.utils import parseaddr
 from uuid import uuid4
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import and_, func, or_
@@ -39,6 +38,8 @@ from .security import COOKIE_NAME, create_session, current_user, hash_otp, hash_
 
 app = FastAPI(title="ONPay API", version="0.1.0", description="Student cash exchange coordination API")
 logger = logging.getLogger("onpay.auth")
+RESEND_EMAILS_URL = "https://api.resend.com/emails"
+RESEND_REQUEST_TIMEOUT_SECONDS = 10.0
 cors_origins = settings.get_cors_origins()
 cors_options = {
     "allow_origins": cors_origins,
@@ -114,17 +115,13 @@ def send_sms_verify(contact: str, action: str) -> str:
 
 
 def email_delivery_configuration_error() -> str | None:
-    if not settings.smtp_host.strip():
-        return "Email OTP delivery is not configured"
-    if not 1 <= settings.smtp_port <= 65535:
-        return "Email OTP delivery has an invalid SMTP port"
-    if not settings.smtp_username.strip() or not settings.smtp_password:
-        return "Email OTP delivery requires SMTP credentials"
-    sender_address = parseaddr(settings.smtp_from)[1]
+    if settings.email_provider != "resend":
+        return "The configured email provider is not supported"
+    if not settings.resend_api_key.strip():
+        return "Email OTP delivery requires a Resend API key"
+    sender_address = parseaddr(settings.email_from)[1]
     if not sender_address or "@" not in sender_address:
         return "Email OTP delivery requires a valid sender address"
-    if not settings.smtp_use_ssl and not settings.smtp_starttls:
-        return "Email provider must use TLS for SMTP"
     return None
 
 
@@ -137,28 +134,29 @@ def deliver_otp(channel: str, contact: str, code: str) -> str | None:
     configuration_error = email_delivery_configuration_error()
     if configuration_error:
         raise HTTPException(503, configuration_error)
-    message = EmailMessage()
-    message["Subject"] = "Your ONPay sign-in code"
-    message["From"] = settings.smtp_from
-    message["To"] = contact
-    message.set_content(f"Your ONPay verification code is {code}. It expires in {settings.otp_ttl_minutes} minutes.")
+    response = httpx.post(
+        RESEND_EMAILS_URL,
+        headers={
+            "Authorization": f"Bearer {settings.resend_api_key.strip()}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "from": settings.email_from,
+            "to": [contact],
+            "subject": "Your ONPay sign-in code",
+            "text": f"Your ONPay verification code is {code}. It expires in {settings.otp_ttl_minutes} minutes.",
+        },
+        timeout=RESEND_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
     try:
-        if settings.smtp_use_ssl or settings.smtp_port == 465:
-            with smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=10) as server:
-                if settings.smtp_username:
-                    server.login(settings.smtp_username, settings.smtp_password)
-                server.send_message(message)
-        else:
-            with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                if settings.smtp_username:
-                    server.login(settings.smtp_username, settings.smtp_password)
-                server.send_message(message)
-    except Exception as exc:
-        raise RuntimeError("SMTP delivery failed") from exc
-    return None
+        result = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Resend returned an invalid acceptance response") from exc
+    email_id = result.get("id") if isinstance(result, dict) else None
+    if not isinstance(email_id, str) or not email_id.strip():
+        raise RuntimeError("Resend returned an invalid acceptance response")
+    return email_id
 
 
 def _record_failed_otp_delivery(db: Session, challenge_id: str) -> None:
@@ -178,11 +176,13 @@ def _log_otp_delivery_failure(
     cause = exc.__cause__ or exc
     provider_status = getattr(cause, "code", None) or getattr(cause, "smtp_code", None)
     if not isinstance(provider_status, int):
+        provider_status = getattr(getattr(cause, "response", None), "status_code", None)
+    if not isinstance(provider_status, int):
         provider_status = "none"
     logger.warning(
         "OTP delivery failed challenge_id=%s channel=%s provider=%s failure=%s "
         "error_type=%s cause_type=%s provider_status=%s",
-        challenge_id, channel, "twilio" if channel == "mobile" else "smtp", failure,
+        challenge_id, channel, "twilio" if channel == "mobile" else "resend", failure,
         type(exc).__name__, type(cause).__name__, provider_status,
     )
 

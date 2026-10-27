@@ -4,6 +4,8 @@ import unittest
 from datetime import timedelta
 from unittest.mock import Mock, patch
 
+import httpx
+
 os.environ["APP_ENV"] = "development"
 os.environ["DEV_OTP_MODE"] = "true"
 os.environ["SECRET_KEY"] = "test-only-secret-key-with-more-than-32-characters"
@@ -14,7 +16,7 @@ from fastapi import HTTPException, Response
 from starlette.datastructures import Headers
 from starlette.middleware.cors import CORSMiddleware
 
-from app.config import settings
+from app.config import Settings, settings
 from app.database import Base, SessionLocal, engine
 from app.main import (
     app, check_quota, cors_options, create_listing, current_month_bounds, fastapi_app,
@@ -31,13 +33,9 @@ class CriticalFixTests(unittest.TestCase):
     def setUp(self):
         settings.app_env = "development"
         settings.dev_otp_mode = True
-        settings.smtp_host = ""
-        settings.smtp_from = ""
-        settings.smtp_username = ""
-        settings.smtp_password = ""
-        settings.smtp_port = 587
-        settings.smtp_starttls = True
-        settings.smtp_use_ssl = False
+        settings.email_provider = "resend"
+        settings.resend_api_key = ""
+        settings.email_from = ""
         settings.twilio_account_sid = ""
         settings.twilio_auth_token = ""
         settings.twilio_verify_service_sid = ""
@@ -56,26 +54,144 @@ class CriticalFixTests(unittest.TestCase):
     def tearDown(self):
         self.db.close()
 
-    def test_production_email_is_sent_over_starttls_and_never_returns_code(self):
+    def _configure_resend(self):
+        settings.email_provider = "resend"
+        settings.resend_api_key = "test_resend_key_not_real"
+        settings.email_from = "ONPay <verify@example.test>"
+
+    @staticmethod
+    def _resend_response(status_code=200, payload=None):
+        request = httpx.Request("POST", "https://api.resend.com/emails")
+        return httpx.Response(status_code, json=payload, request=request)
+
+    def test_resend_configuration_uses_expected_environment_variable_names(self):
+        with patch.dict(os.environ, {
+            "EMAIL_PROVIDER": "resend",
+            "RESEND_API_KEY": "test_resend_key_not_real",
+            "EMAIL_FROM": "ONPay <verify@example.test>",
+        }):
+            configured = Settings(_env_file=None)
+        self.assertEqual(configured.email_provider, "resend")
+        self.assertEqual(configured.resend_api_key, "test_resend_key_not_real")
+        self.assertEqual(configured.email_from, "ONPay <verify@example.test>")
+
+    def test_production_email_uses_resend_and_never_returns_code(self):
         settings.app_env = "production"
         settings.dev_otp_mode = True  # Production must ignore the development mock flag.
-        settings.smtp_host = "smtp.example.test"
-        settings.smtp_from = "ONPay <verify@example.test>"
-        settings.smtp_username = "smtp-user"
-        settings.smtp_password = "smtp-password"
-        with patch("app.main.secrets.randbelow", return_value=123456), patch("app.main.smtplib.SMTP") as smtp:
-            server = smtp.return_value.__enter__.return_value
+        self._configure_resend()
+        with patch("app.main.secrets.randbelow", return_value=123456), patch(
+            "app.main.httpx.post", return_value=self._resend_response(payload={"id": "email-test-id"}),
+        ) as send:
             response = request_otp(OTPRequest(channel="email", contact="new@example.edu", intent="signup", full_name="New Student"), self.db)
             self.assertNotIn("development_code", response)
-            server.starttls.assert_called_once()
-            server.login.assert_called_once_with("smtp-user", "smtp-password")
-            message = server.send_message.call_args.args[0]
-            self.assertIn("123456", message.get_content())
-            challenge = self.db.get(OTPChallenge, response["challenge_id"])
-            self.assertEqual(challenge.delivery_status, "sent")
-            self.assertEqual(verify_otp(OTPVerify(challenge_id=challenge.id, code="123456"), Response(), self.db)["user"]["email"], "new@example.edu")
-            with self.assertRaises(HTTPException):
-                verify_otp(OTPVerify(challenge_id=challenge.id, code="123456"), Response(), self.db)
+            send.assert_called_once()
+        url, = send.call_args.args
+        options = send.call_args.kwargs
+        self.assertEqual(url, "https://api.resend.com/emails")
+        self.assertEqual(options["headers"]["Authorization"], "Bearer test_resend_key_not_real")
+        self.assertEqual(options["headers"]["Content-Type"], "application/json")
+        self.assertEqual(options["json"]["from"], "ONPay <verify@example.test>")
+        self.assertEqual(options["json"]["to"], ["new@example.edu"])
+        self.assertEqual(options["json"]["subject"], "Your ONPay sign-in code")
+        self.assertIn("123456", options["json"]["text"])
+        self.assertEqual(options["timeout"], 10.0)
+        challenge = self.db.get(OTPChallenge, response["challenge_id"])
+        self.assertEqual(challenge.delivery_status, "sent")
+        self.assertEqual(challenge.provider_ref, "email-test-id")
+        self.assertEqual(verify_otp(OTPVerify(challenge_id=challenge.id, code="123456"), Response(), self.db)["user"]["email"], "new@example.edu")
+        with self.assertRaises(HTTPException):
+            verify_otp(OTPVerify(challenge_id=challenge.id, code="123456"), Response(), self.db)
+
+    def test_resend_provider_rejection_marks_challenge_failed_without_sensitive_logs(self):
+        settings.app_env = "production"
+        settings.dev_otp_mode = True
+        self._configure_resend()
+        contact = "rejected@example.edu"
+        with patch("app.main.secrets.randbelow", return_value=123456), patch(
+            "app.main.httpx.post", return_value=self._resend_response(403, {"message": "rejected"}),
+        ), self.assertLogs("onpay.auth", level="WARNING") as logs, self.assertRaises(HTTPException) as failure:
+            request_otp(OTPRequest(channel="email", contact=contact, intent="signup", full_name="Rejected Student"), self.db)
+        self.assertEqual(failure.exception.status_code, 502)
+        challenge = self.db.query(OTPChallenge).filter_by(contact=contact).one()
+        self.assertEqual(challenge.delivery_status, "failed")
+        self.assertIsNone(challenge.code_hash)
+        log_message = "\n".join(logs.output)
+        self.assertIn("provider=resend", log_message)
+        self.assertIn("provider_status=403", log_message)
+        for sensitive_value in (contact, "123456", "test_resend_key_not_real", "rejected"):
+            self.assertNotIn(sensitive_value, log_message)
+
+    def test_resend_timeout_and_connection_failures_mark_challenge_failed(self):
+        settings.app_env = "production"
+        self._configure_resend()
+        failures = (
+            ("timeout@example.edu", httpx.TimeoutException("timeout")),
+            ("connection@example.edu", httpx.ConnectError(
+                "connection failed", request=httpx.Request("POST", "https://api.resend.com/emails"),
+            )),
+        )
+        for contact, failure in failures:
+            with self.subTest(failure_type=type(failure).__name__), patch(
+                "app.main.httpx.post", side_effect=failure,
+            ), self.assertRaises(HTTPException) as response:
+                request_otp(OTPRequest(channel="email", contact=contact, intent="signup", full_name="Network Failure"), self.db)
+            self.assertEqual(response.exception.status_code, 502)
+            challenge = self.db.query(OTPChallenge).filter_by(contact=contact).one()
+            self.assertEqual(challenge.delivery_status, "failed")
+            self.assertIsNone(challenge.code_hash)
+            self.assertIsNone(challenge.provider_ref)
+
+    def test_malformed_resend_acceptance_response_is_a_delivery_failure(self):
+        settings.app_env = "production"
+        self._configure_resend()
+        malformed_responses = (
+            self._resend_response(payload={"message": "no id"}),
+            httpx.Response(
+                200, content=b"not-json", headers={"Content-Type": "application/json"},
+                request=httpx.Request("POST", "https://api.resend.com/emails"),
+            ),
+        )
+        for index, malformed_response in enumerate(malformed_responses):
+            contact = f"malformed-{index}@example.edu"
+            with self.subTest(index=index), patch(
+                "app.main.httpx.post", return_value=malformed_response,
+            ), self.assertRaises(HTTPException) as failure:
+                request_otp(OTPRequest(channel="email", contact=contact, intent="signup", full_name="Malformed Response"), self.db)
+            self.assertEqual(failure.exception.status_code, 502)
+            challenge = self.db.query(OTPChallenge).filter_by(contact=contact).one()
+            self.assertEqual(challenge.delivery_status, "failed")
+            self.assertIsNone(challenge.code_hash)
+
+    def test_production_never_falls_back_to_smtp(self):
+        settings.app_env = "production"
+        self._configure_resend()
+        settings.email_provider = "smtp"
+        with patch("app.main.httpx.post") as send, self.assertRaises(HTTPException) as failure:
+            request_otp(OTPRequest(channel="email", contact="no-fallback@example.edu", intent="signup", full_name="No Fallback"), self.db)
+        self.assertEqual(failure.exception.status_code, 503)
+        send.assert_not_called()
+        challenge = self.db.query(OTPChallenge).filter_by(contact="no-fallback@example.edu").one()
+        self.assertEqual(challenge.delivery_status, "failed")
+        self.assertIsNone(challenge.code_hash)
+
+    def test_production_resend_requires_api_key_and_sender(self):
+        settings.app_env = "production"
+        settings.dev_otp_mode = True  # Production must ignore the development mock flag.
+        configurations = (
+            ("missing-key@example.edu", "", "ONPay <verify@example.test>"),
+            ("missing-sender@example.edu", "test_resend_key_not_real", ""),
+        )
+        for contact, api_key, email_from in configurations:
+            settings.email_provider = "resend"
+            settings.resend_api_key = api_key
+            settings.email_from = email_from
+            with self.subTest(contact=contact), patch("app.main.httpx.post") as send, self.assertRaises(HTTPException) as failure:
+                request_otp(OTPRequest(channel="email", contact=contact, intent="signup", full_name="Missing Config"), self.db)
+            self.assertEqual(failure.exception.status_code, 503)
+            send.assert_not_called()
+            challenge = self.db.query(OTPChallenge).filter_by(contact=contact).one()
+            self.assertEqual(challenge.delivery_status, "failed")
+            self.assertIsNone(challenge.code_hash)
 
     def test_challenge_is_hashed_and_committed_before_delivery(self):
         settings.app_env = "production"
@@ -101,39 +217,6 @@ class CriticalFixTests(unittest.TestCase):
         challenge = self.db.get(OTPChallenge, result["challenge_id"])
         self.assertEqual(challenge.delivery_status, "sent")
         self.assertEqual(challenge.provider_ref, "provider-reference")
-
-    def test_production_email_supports_implicit_tls_on_port_465(self):
-        settings.app_env = "production"
-        settings.dev_otp_mode = False
-        settings.smtp_host = "smtp.example.test"
-        settings.smtp_from = "ONPay <verify@example.test>"
-        settings.smtp_username = "smtp-user"
-        settings.smtp_password = "smtp-password"
-        settings.smtp_port = 465
-        with patch("app.main.smtplib.SMTP_SSL") as smtp_ssl, patch("app.main.smtplib.SMTP") as starttls:
-            response = request_otp(OTPRequest(channel="email", contact="ssl@example.edu", intent="signup", full_name="SSL Student"), self.db)
-        self.assertNotIn("development_code", response)
-        smtp_ssl.assert_called_once_with("smtp.example.test", 465, timeout=10)
-        smtp_ssl.return_value.__enter__.return_value.send_message.assert_called_once()
-        starttls.assert_not_called()
-
-    def test_production_smtp_failure_is_recorded_and_cannot_be_verified(self):
-        settings.app_env = "production"
-        settings.dev_otp_mode = True
-        with self.assertLogs("onpay.auth", level="WARNING") as logs, self.assertRaises(HTTPException) as failure:
-            request_otp(OTPRequest(channel="email", contact="failed@example.edu", intent="signup", full_name="New Student"), self.db)
-        self.assertEqual(failure.exception.status_code, 503)
-        self.assertIn("Email verification is not configured", failure.exception.detail)
-        challenge = self.db.query(OTPChallenge).filter_by(contact="failed@example.edu").one()
-        self.assertEqual(challenge.delivery_status, "failed")
-        self.assertIsNone(challenge.code_hash)
-        log_message = "\n".join(logs.output)
-        self.assertIn("provider=smtp", log_message)
-        self.assertIn("failure=configuration", log_message)
-        self.assertNotIn("failed@example.edu", log_message)
-        self.assertNotIn("123456", log_message)
-        with self.assertRaises(HTTPException):
-            verify_otp(OTPVerify(challenge_id=challenge.id, code="123456"), Response(), self.db)
 
     def test_production_mobile_otp_without_twilio_settings_fails_safely(self):
         settings.app_env = "production"
@@ -166,17 +249,13 @@ class CriticalFixTests(unittest.TestCase):
         self.assertIn("secure", cleared_cookie)
         self.assertIn("samesite=none", cleared_cookie)
 
-    def test_production_email_requires_smtp_auth_credentials(self):
+    def test_production_email_requires_resend_configuration(self):
         settings.app_env = "production"
         settings.dev_otp_mode = False
-        settings.smtp_host = "smtp.example.test"
-        settings.smtp_from = "ONPay <verify@example.test>"
-        settings.smtp_username = ""
-        settings.smtp_password = ""
-        with patch("app.main.smtplib.SMTP") as smtp, self.assertRaises(HTTPException) as failure:
+        with patch("app.main.httpx.post") as send, self.assertRaises(HTTPException) as failure:
             request_otp(OTPRequest(channel="email", contact="missing-creds@example.edu", intent="signup", full_name="New Student"), self.db)
         self.assertEqual(failure.exception.status_code, 503)
-        smtp.assert_not_called()
+        send.assert_not_called()
         challenge = self.db.query(OTPChallenge).filter_by(contact="missing-creds@example.edu").one()
         self.assertEqual(challenge.delivery_status, "failed")
         self.assertIsNone(challenge.code_hash)
@@ -221,12 +300,10 @@ class CriticalFixTests(unittest.TestCase):
         settings.dev_otp_mode = False
         with self.assertRaises(HTTPException):
             request_otp(OTPRequest(channel="email", contact="no-mock@example.edu", intent="signup", full_name="New Student"), self.db)
-        settings.smtp_host = "smtp.example.test"
-        settings.smtp_from = "verify@example.test"
-        settings.smtp_username = "smtp-user"
-        settings.smtp_password = "smtp-password"
-        with patch("app.main.smtplib.SMTP") as smtp:
+        self._configure_resend()
+        with patch("app.main.httpx.post", return_value=self._resend_response(payload={"id": "development-disabled-mock"})) as send:
             challenge = request_otp(OTPRequest(channel="email", contact="real-smtp@example.edu", intent="signup", full_name="New Student"), self.db)
+        send.assert_called_once()
         self.assertNotIn("development_code", challenge)
 
         settings.dev_otp_mode = True
