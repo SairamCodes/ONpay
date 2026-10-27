@@ -15,14 +15,11 @@ class Settings(BaseSettings):
     otp_resend_seconds: int = 30
     otp_max_attempts: int = 5
     dev_otp_mode: bool = False
-    email_provider: Literal["resend", "brevo", "smtp"] = "resend"
+    email_provider: Literal["mailjet", "resend", "brevo"] = "mailjet"
+    mailjet_api_key: str = ""
+    mailjet_secret_key: str = ""
     resend_api_key: str = ""
     brevo_api_key: str = ""
-    smtp_host: str = "smtp.gmail.com"
-    smtp_port: int = 587
-    smtp_username: str = ""
-    smtp_password: str = ""
-    smtp_starttls: bool = True
     email_from: str = ""
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""

@@ -6,8 +6,6 @@ import logging
 import math
 import re
 import secrets
-import smtplib
-import ssl
 import threading
 import time
 import urllib.error
@@ -15,7 +13,6 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from email.message import EmailMessage
 from email.utils import parseaddr
 from uuid import uuid4
 
@@ -43,6 +40,7 @@ app = FastAPI(title="ONPay API", version="0.1.0", description="Student cash exch
 logger = logging.getLogger("onpay.auth")
 RESEND_EMAILS_URL = "https://api.resend.com/emails"
 BREVO_EMAILS_URL = "https://api.brevo.com/v3/smtp/email"
+MAILJET_EMAILS_URL = "https://api.mailjet.com/v3.1/send"
 EMAIL_REQUEST_TIMEOUT_SECONDS = 10.0
 cors_origins = settings.get_cors_origins()
 cors_options = {
@@ -121,21 +119,16 @@ def send_sms_verify(contact: str, action: str) -> str:
 
 
 def email_delivery_configuration_error() -> str | None:
-    if settings.email_provider not in ("resend", "brevo", "smtp"):
+    if settings.email_provider not in ("mailjet", "resend", "brevo"):
         return "The configured email provider is not supported"
-    if settings.email_provider == "smtp":
-        if not settings.smtp_host.strip():
-            return "Email OTP delivery requires an SMTP host"
-        if settings.smtp_port != 587:
-            return "Email OTP delivery requires SMTP port 587"
-        if not settings.smtp_starttls:
-            return "Email OTP delivery requires STARTTLS"
-        if not settings.smtp_username.strip() or not settings.smtp_password:
-            return "Email OTP delivery requires SMTP credentials"
-    api_key = settings.brevo_api_key if settings.email_provider == "brevo" else settings.resend_api_key
-    if settings.email_provider != "smtp" and not api_key.strip():
-        provider_name = "Brevo" if settings.email_provider == "brevo" else "Resend"
-        return f"Email OTP delivery requires a {provider_name} API key"
+    if settings.email_provider == "mailjet":
+        if not settings.mailjet_api_key.strip() or not settings.mailjet_secret_key.strip():
+            return "Email OTP delivery requires Mailjet API credentials"
+    elif settings.email_provider == "brevo":
+        if not settings.brevo_api_key.strip():
+            return "Email OTP delivery requires a Brevo API key"
+    elif not settings.resend_api_key.strip():
+        return "Email OTP delivery requires a Resend API key"
     sender_address = parseaddr(settings.email_from)[1]
     if not sender_address or "@" not in sender_address:
         return "Email OTP delivery requires a valid sender address"
@@ -190,71 +183,22 @@ def deliver_otp(channel: str, contact: str, code: str, challenge_id: str | None 
         raise HTTPException(503, configuration_error)
     subject = "Your ONPay sign-in code"
     text_content = f"Your ONPay verification code is {code}. It expires in {settings.otp_ttl_minutes} minutes."
-    if settings.email_provider == "smtp":
-        message = EmailMessage()
-        message["Subject"] = subject
-        message["From"] = settings.email_from
-        message["To"] = contact
-        message.set_content(text_content)
-        logger.info(
-            "OTP email request started challenge_id=%s provider=smtp attempted=true",
-            challenge_id,
-        )
-        smtp_stage = "connect"
-        try:
-            logger.info(
-                "OTP SMTP stage started challenge_id=%s provider=smtp stage=connect",
-                challenge_id,
-            )
-            with smtplib.SMTP(settings.smtp_host.strip(), settings.smtp_port, timeout=10) as server:
-                logger.info(
-                    "OTP SMTP stage completed challenge_id=%s provider=smtp stage=connect",
-                    challenge_id,
-                )
-                smtp_stage = "starttls"
-                logger.info(
-                    "OTP SMTP stage started challenge_id=%s provider=smtp stage=starttls",
-                    challenge_id,
-                )
-                server.ehlo()
-                server.starttls(context=ssl.create_default_context())
-                server.ehlo()
-                logger.info(
-                    "OTP SMTP stage completed challenge_id=%s provider=smtp stage=starttls",
-                    challenge_id,
-                )
-                smtp_stage = "authenticate"
-                logger.info(
-                    "OTP SMTP stage started challenge_id=%s provider=smtp stage=authenticate",
-                    challenge_id,
-                )
-                server.login(settings.smtp_username.strip(), settings.smtp_password)
-                logger.info(
-                    "OTP SMTP stage completed challenge_id=%s provider=smtp stage=authenticate",
-                    challenge_id,
-                )
-                smtp_stage = "send"
-                logger.info(
-                    "OTP SMTP stage started challenge_id=%s provider=smtp stage=send",
-                    challenge_id,
-                )
-                server.send_message(message)
-                logger.info(
-                    "OTP SMTP stage completed challenge_id=%s provider=smtp stage=send",
-                    challenge_id,
-                )
-        except Exception as exc:
-            logger.warning(
-                "OTP email request failed challenge_id=%s provider=smtp attempted=true stage=%s error_type=%s",
-                challenge_id, smtp_stage, type(exc).__name__,
-            )
-            raise RuntimeError("SMTP email delivery failed") from exc
-        logger.info(
-            "OTP email provider accepted challenge_id=%s provider=smtp",
-            challenge_id,
-        )
-        return None
-    if settings.email_provider == "brevo":
+    if settings.email_provider == "mailjet":
+        sender_name, sender_address = parseaddr(settings.email_from)
+        sender = {"Email": sender_address}
+        if sender_name:
+            sender["Name"] = sender_name
+        endpoint = MAILJET_EMAILS_URL
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        body = {
+            "Messages": [{
+                "From": sender,
+                "To": [{"Email": contact}],
+                "Subject": subject,
+                "TextPart": text_content,
+            }],
+        }
+    elif settings.email_provider == "brevo":
         sender_name, sender_address = parseaddr(settings.email_from)
         sender = {"email": sender_address}
         if sender_name:
@@ -288,12 +232,16 @@ def deliver_otp(channel: str, contact: str, code: str, challenge_id: str | None 
         challenge_id, settings.email_provider,
     )
     try:
-        response = httpx.post(
-            endpoint,
-            headers=headers,
-            json=body,
-            timeout=EMAIL_REQUEST_TIMEOUT_SECONDS,
-        )
+        request_options = {
+            "headers": headers,
+            "json": body,
+            "timeout": EMAIL_REQUEST_TIMEOUT_SECONDS,
+        }
+        if settings.email_provider == "mailjet":
+            request_options["auth"] = (
+                settings.mailjet_api_key.strip(), settings.mailjet_secret_key.strip(),
+            )
+        response = httpx.post(endpoint, **request_options)
     except httpx.RequestError as exc:
         logger.warning(
             "OTP email request failed challenge_id=%s provider=%s attempted=true error_type=%s",
@@ -304,7 +252,12 @@ def deliver_otp(channel: str, contact: str, code: str, challenge_id: str | None 
         "OTP email provider response challenge_id=%s provider=%s http_status=%s",
         challenge_id, settings.email_provider, response.status_code,
     )
-    if settings.email_provider == "brevo" and not response.is_success:
+    if settings.email_provider == "mailjet" and not response.is_success:
+        logger.warning(
+            "OTP email provider rejected request challenge_id=%s provider=mailjet http_status=%s reason=http_error",
+            challenge_id, response.status_code,
+        )
+    elif settings.email_provider == "brevo" and not response.is_success:
         logger.warning(
             "OTP email provider rejected request challenge_id=%s provider=brevo http_status=%s error_message=%s",
             challenge_id, response.status_code, _safe_brevo_error_message(response, contact, code),
@@ -313,14 +266,38 @@ def deliver_otp(channel: str, contact: str, code: str, challenge_id: str | None 
     try:
         result = response.json()
     except ValueError as exc:
-        provider_name = "Brevo" if settings.email_provider == "brevo" else "Resend"
+        provider_name = {
+            "mailjet": "Mailjet", "brevo": "Brevo", "resend": "Resend",
+        }[settings.email_provider]
         logger.warning(
             "OTP email provider acceptance response invalid challenge_id=%s provider=%s http_status=%s reason=invalid_json",
             challenge_id, settings.email_provider, response.status_code,
         )
         raise RuntimeError(f"{provider_name} returned an invalid acceptance response") from exc
-    response_id_field = "messageId" if settings.email_provider == "brevo" else "id"
-    email_id = result.get(response_id_field) if isinstance(result, dict) else None
+    if settings.email_provider == "mailjet":
+        messages = result.get("Messages") if isinstance(result, dict) else None
+        message_result = messages[0] if isinstance(messages, list) and messages else None
+        recipient_results = message_result.get("To") if isinstance(message_result, dict) else None
+        recipient_result = recipient_results[0] if isinstance(recipient_results, list) and recipient_results else None
+        raw_email_id = None
+        if isinstance(recipient_result, dict):
+            raw_email_id = recipient_result.get("MessageUUID") or recipient_result.get("MessageID")
+        if not isinstance(message_result, dict) or message_result.get("Status") != "success":
+            logger.warning(
+                "OTP email provider rejected request challenge_id=%s provider=mailjet http_status=%s reason=message_not_accepted",
+                challenge_id, response.status_code,
+            )
+            raise RuntimeError("Mailjet did not accept the email")
+        if isinstance(raw_email_id, bool) or not isinstance(raw_email_id, (str, int)) or not str(raw_email_id).strip():
+            logger.warning(
+                "OTP email provider acceptance response invalid challenge_id=%s provider=mailjet http_status=%s reason=missing_message_id",
+                challenge_id, response.status_code,
+            )
+            raise RuntimeError("Mailjet returned an invalid acceptance response")
+        email_id = str(raw_email_id)
+    else:
+        response_id_field = "messageId" if settings.email_provider == "brevo" else "id"
+        email_id = result.get(response_id_field) if isinstance(result, dict) else None
     if not isinstance(email_id, str) or not email_id.strip():
         provider_name = "Brevo" if settings.email_provider == "brevo" else "Resend"
         logger.warning(
@@ -350,7 +327,7 @@ def _log_otp_delivery_failure(
     challenge_id: str, channel: str, exc: Exception, failure: str,
 ) -> None:
     cause = exc.__cause__ or exc
-    provider_status = getattr(cause, "code", None) or getattr(cause, "smtp_code", None)
+    provider_status = getattr(cause, "code", None)
     if not isinstance(provider_status, int):
         provider_status = getattr(getattr(cause, "response", None), "status_code", None)
     if not isinstance(provider_status, int):

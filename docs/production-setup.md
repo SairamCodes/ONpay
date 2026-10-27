@@ -2,32 +2,31 @@
 
 ## Email OTP
 
-Copy `backend/.env.example` to `backend/.env`. Obtain the values below from the email provider that will send ONPay's transactional mail; the example values are intentionally blank and are not credentials.
+ONPay sends email OTPs through Mailjet's HTTPS Send API v3.1. Before sending, add the sender address in Mailjet under **Account Settings → Senders & Domains** and confirm the verification email. Mailjet's API requires an active sender address; a whole sending domain can be validated instead if you control its DNS. The request uses HTTPS Basic Auth with the public API key as the username and private API key as the password. ONPay does not send email through SMTP.
+
+For local development, copy `backend/.env.example` to `backend/.env`. For Render, set these as backend service environment variables in the Render dashboard; do not put credentials in the repository or frontend environment:
 
 ```dotenv
 APP_ENV=production
 DEV_OTP_MODE=false
 SECRET_KEY=<a random secret with at least 32 characters>
-SMTP_HOST=<provider SMTP hostname>
-SMTP_PORT=587
-SMTP_USERNAME=<provider SMTP username>
-SMTP_PASSWORD=<provider SMTP password or app password>
-SMTP_FROM=<verified sender name and email>
-SMTP_STARTTLS=true
-SMTP_USE_SSL=false
+EMAIL_PROVIDER=mailjet
+MAILJET_API_KEY=<Mailjet public API key>
+MAILJET_SECRET_KEY=<Mailjet private API key>
+EMAIL_FROM=ONPay <verified-sender@example.com>
 ```
 
-Use the provider's documented host and port. Port 587 uses STARTTLS. Port 465 uses implicit TLS; set `SMTP_USE_SSL=true` (port 465 is also detected automatically). `SMTP_FROM` must be an address the provider has authorized. Credentials belong only in the untracked `backend/.env` or a deployment secret store, never in the repository or browser bundle.
+Use the exact sender address that Mailjet shows as active. Mailjet also offers sender-address verification without DNS, but it warns that Gmail, Yahoo, Outlook, and other free-mail sender domains can be spam-foldered or rejected because you cannot configure their SPF/DKIM records. A custom domain with SPF/DKIM is the recommended sender identity for dependable production OTP delivery. See Mailjet's [sender verification guide](https://documentation.mailjet.com/hc/en-us/articles/360042759253-How-to-add-a-sender-address) and [free-mail sender guidance](https://documentation.mailjet.com/hc/en-us/articles/19308800104091-Why-you-should-avoid-free-webmail-as-a-sender-address).
 
-The API requires `SMTP_HOST`, a valid `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, a valid authorized `SMTP_FROM`, and TLS. Missing or insecure email settings return HTTP 503; provider delivery failures return a safe HTTP 502. The API persists an OTP challenge and its keyed hash before delivery, marks it `sent` only after the provider accepts the request, and records a `failed` state and clears the hash if delivery fails. OTPs are cryptographically random, six digits, expire after five minutes, have a resend cooldown and attempt limit, and are consumed after verification. A successful request response includes `accepted: true`; the frontend does not open the verification screen without that flag and a valid challenge ID. Production ignores `DEV_OTP_MODE` and never returns the OTP. For isolated development only, set both `APP_ENV=development` and `DEV_OTP_MODE=true` to receive a dynamically generated mock code in the response.
+The backend requires `EMAIL_PROVIDER=mailjet`, both Mailjet API keys, and a valid `EMAIL_FROM`. It sends `POST https://api.mailjet.com/v3.1/send` with a 10-second timeout and marks a challenge sent only after Mailjet returns HTTP success, message status `success`, and a message ID. Missing configuration returns HTTP 503; provider rejection or transport errors return a safe HTTP 502 and leave the challenge failed with its code hash cleared. OTPs remain cryptographically random, six digits, expire after five minutes, have a resend cooldown and attempt limit, and are consumed after verification. Ineligible signup/login requests are still suppressed to avoid revealing whether an account exists. A successful eligible request includes `accepted: true`; the frontend does not open the verification screen without that flag and a valid challenge ID. Production never returns the OTP. For isolated development only, set both `APP_ENV=development` and `DEV_OTP_MODE=true` to receive a dynamically generated mock code in the response.
 
-To test real email delivery, use a dedicated test inbox and the provider's actual SMTP credentials. The mock SMTP unit test confirms STARTTLS setup and delivery-state handling but does not send a real message.
+To test real email delivery, set `DEV_OTP_MODE=false`, use a test inbox, and configure Mailjet's real API credentials and active sender address. Automated tests mock the HTTPS API and never send real email.
 
 ## Frontend and backend connectivity
 
-For local development, leave `VITE_API_BASE_URL` unset. Vite uses the browser's current hostname on port 8000, so a page opened from another device does not accidentally call that device's own `localhost`. To test from a phone or another computer, run the API bound to your development machine's network interface (for example `uvicorn app.main:app --reload --host 0.0.0.0`) and add the exact frontend origin, such as `http://192.168.1.40:5173`, to backend `FRONTEND_ORIGINS`. Only add trusted devices on your local network. Production builds require `VITE_API_BASE_URL` to be set to the backend's public HTTPS origin in the frontend hosting platform before the build. For example, use the API origin such as `https://api.your-domain.example`, without `/api` at the end. This is public build configuration, so never put SMTP credentials, database URLs, or other secrets in a `VITE_` variable. Rebuild and redeploy the frontend after changing it.
+For local development, leave `VITE_API_BASE_URL` unset. Vite uses the browser's current hostname on port 8000, so a page opened from another device does not accidentally call that device's own `localhost`. To test from a phone or another computer, run the API bound to your development machine's network interface (for example `uvicorn app.main:app --reload --host 0.0.0.0`) and add the exact frontend origin, such as `http://192.168.1.40:5173`, to backend `FRONTEND_ORIGINS`. Only add trusted devices on your local network. Production builds require `VITE_API_BASE_URL` to be set to the backend's public HTTPS origin in the frontend hosting platform before the build. For example, use the API origin such as `https://api.your-domain.example`, without `/api` at the end. This is public build configuration, so never put Mailjet API keys, database URLs, or other secrets in a `VITE_` variable. Rebuild and redeploy the frontend after changing it.
 
-On the backend hosting platform, set `APP_ENV=production`, a random `SECRET_KEY` of at least 32 characters, and `FRONTEND_ORIGINS` to a comma-separated list of exact frontend origins, such as `https://onpay.your-domain.example,https://preview.your-domain.example`. The API permits credentials only for those configured origins. Do not set a wildcard origin. Configure SMTP and database variables on the backend service. Both the frontend and API must be reachable over HTTPS for browsers to allow credentialed requests.
+On the backend hosting platform, set `APP_ENV=production`, `DEV_OTP_MODE=false`, a random `SECRET_KEY` of at least 32 characters, and `FRONTEND_ORIGINS` to a comma-separated list of exact frontend origins, such as `https://onpay.your-domain.example,https://preview.onpay.example`. Set `EMAIL_PROVIDER=mailjet`, `MAILJET_API_KEY`, `MAILJET_SECRET_KEY`, and `EMAIL_FROM` on the backend service, along with the database variables. Keep provider credentials server-side; never use a `VITE_` variable for them. The API permits credentials only for configured frontend origins. Do not set a wildcard origin. Both the frontend and API must be reachable over HTTPS for browsers to allow credentialed requests.
 
 The session cookie defaults to `SESSION_COOKIE_SAMESITE=lax`. Keep this for same-site frontend/API deployments, including different subdomains of one site. If the frontend and API are on different sites, set `SESSION_COOKIE_SAMESITE=none`; ONPay then marks the cookie Secure. Browsers may block third-party cookies, so a same-site API domain or reverse proxy is more reliable.
 
@@ -75,4 +74,4 @@ The API catalog is fixed to Free ₹0 / 5, Plus ₹199 / 20, and Premium ₹499 
 
 Run `alembic upgrade head` from the directory containing the active backend `.env` before starting/deploying the API. Migration `0002_location_otp_plans` adds coordinate and OTP delivery state columns and renames stored `pro` plan values to `premium`. `create_all()` at API startup creates missing tables but does not apply schema upgrades to existing tables.
 
-Run the backend with `python -m unittest discover -s tests -v`. From `frontend/`, run `npm test` and `npm run build`. Real SMTP, GPS permissions, location provider calls, camera devices, UPI apps, subscription billing, and real-money settlement require external configuration and device-level validation.
+Run the backend with `python -m unittest discover -s tests -v`. From `frontend/`, run `npm test` and `npm run build`. Real Mailjet delivery, GPS permissions, location provider calls, camera devices, UPI apps, subscription billing, and real-money settlement require external configuration and device-level validation.

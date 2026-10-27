@@ -1,6 +1,5 @@
 import json
 import os
-import smtplib
 import unittest
 from datetime import timedelta
 from unittest.mock import Mock, patch
@@ -34,14 +33,11 @@ class CriticalFixTests(unittest.TestCase):
     def setUp(self):
         settings.app_env = "development"
         settings.dev_otp_mode = True
-        settings.email_provider = "resend"
+        settings.email_provider = "mailjet"
+        settings.mailjet_api_key = ""
+        settings.mailjet_secret_key = ""
         settings.resend_api_key = ""
         settings.brevo_api_key = ""
-        settings.smtp_host = "smtp.gmail.com"
-        settings.smtp_port = 587
-        settings.smtp_username = ""
-        settings.smtp_password = ""
-        settings.smtp_starttls = True
         settings.email_from = ""
         settings.twilio_account_sid = ""
         settings.twilio_auth_token = ""
@@ -71,14 +67,11 @@ class CriticalFixTests(unittest.TestCase):
         settings.brevo_api_key = "test_brevo_key_not_real"
         settings.email_from = "ONPay <verify@example.test>"
 
-    def _configure_smtp(self):
-        settings.email_provider = "smtp"
-        settings.smtp_host = "smtp.gmail.com"
-        settings.smtp_port = 587
-        settings.smtp_username = "onpay-test@example.test"
-        settings.smtp_password = "test_google_app_password_not_real"
-        settings.smtp_starttls = True
-        settings.email_from = "ONPay <onpay-test@example.test>"
+    def _configure_mailjet(self):
+        settings.email_provider = "mailjet"
+        settings.mailjet_api_key = "test_mailjet_public_key_not_real"
+        settings.mailjet_secret_key = "test_mailjet_secret_key_not_real"
+        settings.email_from = "ONPay <verify@example.test>"
 
     @staticmethod
     def _resend_response(status_code=200, payload=None):
@@ -88,6 +81,16 @@ class CriticalFixTests(unittest.TestCase):
     @staticmethod
     def _brevo_response(status_code=201, payload=None):
         request = httpx.Request("POST", "https://api.brevo.com/v3/smtp/email")
+        return httpx.Response(status_code, json=payload, request=request)
+
+    @staticmethod
+    def _mailjet_response(status_code=200, payload=None):
+        request = httpx.Request("POST", "https://api.mailjet.com/v3.1/send")
+        if payload is None:
+            payload = {"Messages": [{
+                "Status": "success",
+                "To": [{"MessageUUID": "mailjet-message-uuid", "MessageID": 12345}],
+            }]}
         return httpx.Response(status_code, json=payload, request=request)
 
     def test_resend_configuration_uses_expected_environment_variable_names(self):
@@ -112,24 +115,18 @@ class CriticalFixTests(unittest.TestCase):
         self.assertEqual(configured.brevo_api_key, "test_brevo_key_not_real")
         self.assertEqual(configured.email_from, "ONPay <verify@example.test>")
 
-    def test_smtp_configuration_uses_expected_environment_variable_names(self):
+    def test_mailjet_configuration_uses_expected_environment_variable_names(self):
         with patch.dict(os.environ, {
-            "EMAIL_PROVIDER": "smtp",
-            "SMTP_HOST": "smtp.gmail.com",
-            "SMTP_PORT": "587",
-            "SMTP_USERNAME": "onpay-test@example.test",
-            "SMTP_PASSWORD": "test_google_app_password_not_real",
-            "SMTP_STARTTLS": "true",
-            "EMAIL_FROM": "ONPay <onpay-test@example.test>",
+            "EMAIL_PROVIDER": "mailjet",
+            "MAILJET_API_KEY": "test_mailjet_public_key_not_real",
+            "MAILJET_SECRET_KEY": "test_mailjet_secret_key_not_real",
+            "EMAIL_FROM": "ONPay <verify@example.test>",
         }, clear=False):
             configured = Settings(_env_file=None)
-        self.assertEqual(configured.email_provider, "smtp")
-        self.assertEqual(configured.smtp_host, "smtp.gmail.com")
-        self.assertEqual(configured.smtp_port, 587)
-        self.assertEqual(configured.smtp_username, "onpay-test@example.test")
-        self.assertEqual(configured.smtp_password, "test_google_app_password_not_real")
-        self.assertTrue(configured.smtp_starttls)
-        self.assertEqual(configured.email_from, "ONPay <onpay-test@example.test>")
+        self.assertEqual(configured.email_provider, "mailjet")
+        self.assertEqual(configured.mailjet_api_key, "test_mailjet_public_key_not_real")
+        self.assertEqual(configured.mailjet_secret_key, "test_mailjet_secret_key_not_real")
+        self.assertEqual(configured.email_from, "ONPay <verify@example.test>")
 
     def test_production_email_uses_resend_and_never_returns_code(self):
         settings.app_env = "production"
@@ -191,127 +188,91 @@ class CriticalFixTests(unittest.TestCase):
         self.assertNotIn("brevo-user@example.edu", log_message)
         self.assertNotIn("test_brevo_key_not_real", log_message)
 
-    def test_production_email_uses_gmail_smtp_starttls_and_never_returns_code(self):
+    def test_production_email_uses_mailjet_https_api_and_never_returns_code(self):
         settings.app_env = "production"
         settings.dev_otp_mode = False
-        self._configure_smtp()
+        self._configure_mailjet()
         with patch("app.main.secrets.randbelow", return_value=123456), patch(
-            "app.main.smtplib.SMTP",
-        ) as smtp, self.assertLogs("onpay.auth", level="INFO") as delivery_logs:
+            "app.main.httpx.post", return_value=self._mailjet_response(),
+        ) as send, self.assertLogs("onpay.auth", level="INFO") as delivery_logs:
             result = request_otp(OTPRequest(
-                channel="email", contact="student@example.edu", intent="signup", full_name="SMTP Student",
+                channel="email", contact="student@example.edu", intent="signup", full_name="Mailjet Student",
             ), self.db)
 
         self.assertNotIn("development_code", result)
-        smtp.assert_called_once_with("smtp.gmail.com", 587, timeout=10)
-        server = smtp.return_value.__enter__.return_value
-        self.assertEqual(server.ehlo.call_count, 2)
-        server.starttls.assert_called_once()
-        self.assertIsNotNone(server.starttls.call_args.kwargs["context"])
-        server.login.assert_called_once_with("onpay-test@example.test", "test_google_app_password_not_real")
-        message = server.send_message.call_args.args[0]
-        self.assertEqual(message["Subject"], "Your ONPay sign-in code")
-        self.assertEqual(message["From"], "ONPay <onpay-test@example.test>")
-        self.assertEqual(message["To"], "student@example.edu")
-        self.assertIn("123456", message.get_content())
+        send.assert_called_once()
+        url, = send.call_args.args
+        options = send.call_args.kwargs
+        self.assertEqual(url, "https://api.mailjet.com/v3.1/send")
+        self.assertEqual(options["auth"], ("test_mailjet_public_key_not_real", "test_mailjet_secret_key_not_real"))
+        self.assertEqual(options["headers"]["Content-Type"], "application/json")
+        self.assertEqual(options["json"]["Messages"][0]["From"], {"Email": "verify@example.test", "Name": "ONPay"})
+        self.assertEqual(options["json"]["Messages"][0]["To"], [{"Email": "student@example.edu"}])
+        self.assertEqual(options["json"]["Messages"][0]["Subject"], "Your ONPay sign-in code")
+        self.assertIn("123456", options["json"]["Messages"][0]["TextPart"])
+        self.assertEqual(options["timeout"], 10.0)
         challenge = self.db.get(OTPChallenge, result["challenge_id"])
         self.assertEqual(challenge.delivery_status, "sent")
-        self.assertIsNone(challenge.provider_ref)
+        self.assertEqual(challenge.provider_ref, "mailjet-message-uuid")
         log_message = "\n".join(delivery_logs.output)
-        for sensitive_value in ("123456", "student@example.edu", "test_google_app_password_not_real"):
-            self.assertNotIn(sensitive_value, log_message)
-        for stage in ("connect", "starttls", "authenticate", "send"):
-            self.assertIn(f"stage={stage}", log_message)
-
-    def test_smtp_failure_marks_challenge_failed_without_sensitive_logs(self):
-        settings.app_env = "production"
-        settings.dev_otp_mode = False
-        self._configure_smtp()
-        contact = "smtp-failed@example.edu"
-        with patch("app.main.secrets.randbelow", return_value=123456), patch(
-            "app.main.smtplib.SMTP",
-        ) as smtp, self.assertLogs("onpay.auth", level="WARNING") as logs, self.assertRaises(HTTPException) as failure:
-            smtp.return_value.__enter__.return_value.login.side_effect = smtplib.SMTPAuthenticationError(
-                535, b"test app password rejected",
-            )
-            request_otp(OTPRequest(channel="email", contact=contact, intent="signup", full_name="SMTP Student"), self.db)
-        self.assertEqual(failure.exception.status_code, 502)
-        challenge = self.db.query(OTPChallenge).filter_by(contact=contact).one()
-        self.assertEqual(challenge.delivery_status, "failed")
-        self.assertIsNone(challenge.code_hash)
-        self.assertIsNone(challenge.provider_ref)
-        log_message = "\n".join(logs.output)
-        self.assertIn("provider=smtp", log_message)
-        self.assertIn("SMTPAuthenticationError", log_message)
-        self.assertIn("stage=authenticate", log_message)
-        for sensitive_value in (contact, "123456", "test_google_app_password_not_real", "test app password rejected"):
+        self.assertIn("provider=mailjet", log_message)
+        self.assertIn("attempted=true", log_message)
+        self.assertIn("http_status=200", log_message)
+        for sensitive_value in (
+            "123456", "student@example.edu", "test_mailjet_public_key_not_real",
+            "test_mailjet_secret_key_not_real",
+        ):
             self.assertNotIn(sensitive_value, log_message)
 
-    def test_smtp_connection_failure_is_reported_and_challenge_is_not_sent(self):
+    def test_mailjet_http_failure_marks_challenge_failed_without_sensitive_logs(self):
         settings.app_env = "production"
         settings.dev_otp_mode = False
-        self._configure_smtp()
-        contact = "smtp-connect-failed@example.edu"
+        self._configure_mailjet()
+        contact = "mailjet-rejected@example.edu"
         with patch("app.main.secrets.randbelow", return_value=123456), patch(
-            "app.main.smtplib.SMTP", side_effect=OSError("private connection diagnostic"),
+            "app.main.httpx.post", return_value=self._mailjet_response(401, {
+                "ErrorMessage": f"bad key for {contact}; code 123456; test_mailjet_secret_key_not_real",
+            }),
         ), self.assertLogs("onpay.auth", level="WARNING") as logs, self.assertRaises(HTTPException) as failure:
-            request_otp(OTPRequest(channel="email", contact=contact, intent="signup", full_name="SMTP Student"), self.db)
+            request_otp(OTPRequest(channel="email", contact=contact, intent="signup", full_name="Rejected Student"), self.db)
         self.assertEqual(failure.exception.status_code, 502)
         challenge = self.db.query(OTPChallenge).filter_by(contact=contact).one()
         self.assertEqual(challenge.delivery_status, "failed")
         self.assertIsNone(challenge.code_hash)
         self.assertIsNone(challenge.provider_ref)
         log_message = "\n".join(logs.output)
-        self.assertIn("provider=smtp", log_message)
-        self.assertIn("stage=connect", log_message)
-        self.assertIn("error_type=OSError", log_message)
-        for sensitive_value in (contact, "123456", "test_google_app_password_not_real", "private connection diagnostic"):
+        self.assertIn("provider=mailjet", log_message)
+        self.assertIn("http_status=401", log_message)
+        self.assertIn("HTTPStatusError", log_message)
+        for sensitive_value in (contact, "123456", "test_mailjet_public_key_not_real", "test_mailjet_secret_key_not_real"):
             self.assertNotIn(sensitive_value, log_message)
 
-    def test_smtp_send_failure_is_reported_and_challenge_is_not_sent(self):
+    def test_mailjet_message_rejection_is_not_marked_sent(self):
         settings.app_env = "production"
         settings.dev_otp_mode = False
-        self._configure_smtp()
-        contact = "smtp-send-failed@example.edu"
+        self._configure_mailjet()
+        contact = "mailjet-message-rejected@example.edu"
+        response = self._mailjet_response(payload={"Messages": [{"Status": "error", "Errors": [{"ErrorMessage": "sender rejected"}]}]})
         with patch("app.main.secrets.randbelow", return_value=123456), patch(
-            "app.main.smtplib.SMTP",
-        ) as smtp, self.assertLogs("onpay.auth", level="WARNING") as logs, self.assertRaises(HTTPException) as failure:
-            smtp.return_value.__enter__.return_value.send_message.side_effect = smtplib.SMTPDataError(
-                550, f"rejected {contact}; otp=123456".encode(),
-            )
-            request_otp(OTPRequest(channel="email", contact=contact, intent="signup", full_name="SMTP Student"), self.db)
+            "app.main.httpx.post", return_value=response,
+        ), self.assertLogs("onpay.auth", level="WARNING") as logs, self.assertRaises(HTTPException) as failure:
+            request_otp(OTPRequest(channel="email", contact=contact, intent="signup", full_name="Rejected Student"), self.db)
         self.assertEqual(failure.exception.status_code, 502)
         challenge = self.db.query(OTPChallenge).filter_by(contact=contact).one()
         self.assertEqual(challenge.delivery_status, "failed")
         self.assertIsNone(challenge.code_hash)
-        self.assertIsNone(challenge.provider_ref)
-        log_message = "\n".join(logs.output)
-        self.assertIn("provider=smtp", log_message)
-        self.assertIn("stage=send", log_message)
-        self.assertIn("error_type=SMTPDataError", log_message)
-        for sensitive_value in (contact, "123456", "test_google_app_password_not_real", "otp=123456"):
-            self.assertNotIn(sensitive_value, log_message)
+        self.assertIn("reason=message_not_accepted", "\n".join(logs.output))
 
-    def test_smtp_requires_credentials_tls_and_port_587(self):
+    def test_mailjet_requires_both_credentials(self):
         settings.app_env = "production"
         settings.dev_otp_mode = False
-        configurations = (
-            ("missing-credentials@example.edu", "", "", 587, True),
-            ("disabled-tls@example.edu", "onpay-test@example.test", "test-password", 587, False),
-            ("wrong-port@example.edu", "onpay-test@example.test", "test-password", 465, True),
-        )
-        for contact, username, password, port, starttls in configurations:
-            settings.email_provider = "smtp"
-            settings.smtp_host = "smtp.gmail.com"
-            settings.smtp_port = port
-            settings.smtp_username = username
-            settings.smtp_password = password
-            settings.smtp_starttls = starttls
-            settings.email_from = "ONPay <onpay-test@example.test>"
-            with self.subTest(contact=contact), patch("app.main.smtplib.SMTP") as smtp, self.assertRaises(HTTPException) as failure:
-                request_otp(OTPRequest(channel="email", contact=contact, intent="signup", full_name="Missing Config"), self.db)
-            self.assertEqual(failure.exception.status_code, 503)
-            smtp.assert_not_called()
+        settings.email_from = "ONPay <verify@example.test>"
+        settings.mailjet_api_key = "test_mailjet_public_key_not_real"
+        settings.mailjet_secret_key = ""
+        with patch("app.main.httpx.post") as send, self.assertRaises(HTTPException) as failure:
+            request_otp(OTPRequest(channel="email", contact="missing-mailjet-secret@example.edu", intent="signup", full_name="Missing Config"), self.db)
+        self.assertEqual(failure.exception.status_code, 503)
+        send.assert_not_called()
 
     def test_brevo_api_error_fails_challenge_without_sensitive_logs(self):
         settings.app_env = "production"
@@ -427,15 +388,14 @@ class CriticalFixTests(unittest.TestCase):
             self.assertEqual(challenge.delivery_status, "failed")
             self.assertIsNone(challenge.code_hash)
 
-    def test_unsupported_email_provider_does_not_fall_back(self):
+    def test_legacy_smtp_provider_is_rejected_without_fallback(self):
         settings.app_env = "production"
         self._configure_resend()
-        settings.email_provider = "unsupported"
-        with patch("app.main.httpx.post") as http_send, patch("app.main.smtplib.SMTP") as smtp, self.assertRaises(HTTPException) as failure:
+        settings.email_provider = "smtp"
+        with patch("app.main.httpx.post") as http_send, self.assertRaises(HTTPException) as failure:
             request_otp(OTPRequest(channel="email", contact="no-fallback@example.edu", intent="signup", full_name="No Fallback"), self.db)
         self.assertEqual(failure.exception.status_code, 503)
         http_send.assert_not_called()
-        smtp.assert_not_called()
         challenge = self.db.query(OTPChallenge).filter_by(contact="no-fallback@example.edu").one()
         self.assertEqual(challenge.delivery_status, "failed")
         self.assertIsNone(challenge.code_hash)
@@ -515,7 +475,7 @@ class CriticalFixTests(unittest.TestCase):
         self.assertIn("secure", cleared_cookie)
         self.assertIn("samesite=none", cleared_cookie)
 
-    def test_production_email_requires_resend_configuration(self):
+    def test_production_email_requires_mailjet_configuration(self):
         settings.app_env = "production"
         settings.dev_otp_mode = False
         with patch("app.main.httpx.post") as send, self.assertRaises(HTTPException) as failure:
@@ -576,7 +536,7 @@ class CriticalFixTests(unittest.TestCase):
             request_otp(OTPRequest(channel="email", contact="no-mock@example.edu", intent="signup", full_name="New Student"), self.db)
         self._configure_resend()
         with patch("app.main.httpx.post", return_value=self._resend_response(payload={"id": "development-disabled-mock"})) as send:
-            challenge = request_otp(OTPRequest(channel="email", contact="real-smtp@example.edu", intent="signup", full_name="New Student"), self.db)
+            challenge = request_otp(OTPRequest(channel="email", contact="real-provider@example.edu", intent="signup", full_name="New Student"), self.db)
         send.assert_called_once()
         self.assertNotIn("development_code", challenge)
 
@@ -605,10 +565,10 @@ class CriticalFixTests(unittest.TestCase):
         with self.assertRaises(HTTPException):
             verify_otp(OTPVerify(challenge_id=row.id, code=challenge["development_code"]), Response(), self.db)
 
-    def test_ineligible_login_is_accepted_but_suppressed_without_brevo(self):
+    def test_ineligible_login_is_accepted_but_suppressed_without_mailjet(self):
         settings.app_env = "production"
         settings.dev_otp_mode = False
-        self._configure_brevo()
+        self._configure_mailjet()
         with patch("app.main.httpx.post") as send, self.assertLogs("onpay.auth", level="INFO") as logs:
             result = request_otp(OTPRequest(
                 channel="email", contact="not-registered@example.edu", intent="login",
@@ -620,7 +580,7 @@ class CriticalFixTests(unittest.TestCase):
         challenge = self.db.query(OTPChallenge).filter_by(contact="not-registered@example.edu").one()
         self.assertEqual(challenge.delivery_status, "suppressed")
         log_message = "\n".join(logs.output)
-        self.assertIn("provider=brevo", log_message)
+        self.assertIn("provider=mailjet", log_message)
         self.assertIn("attempted=false", log_message)
         self.assertIn("reason=ineligible", log_message)
 

@@ -7,7 +7,7 @@ ONPay helps students find a nearby person to exchange physical cash for a UPI pa
 - `frontend/` — mobile-first React + TypeScript app built with Vite.
 - `backend/` — FastAPI service with SQLAlchemy persistence and an Alembic migration.
 - `docs/payment-integration.md` — UPI and YouPI-PG compatibility assessment.
-- `docs/production-setup.md` — SMTP, location, camera, plans, and device testing.
+- `docs/production-setup.md` — Mailjet email delivery, location, camera, plans, and device testing.
 
 ## Local development
 
@@ -34,7 +34,7 @@ Requirements: Node.js 20+ and Python 3.10+.
 
    Open `http://localhost:5173`. For testing on a phone on the same network, bind the API with `uvicorn app.main:app --reload --host 0.0.0.0`, leave `VITE_API_BASE_URL` unset, and set `FRONTEND_ORIGINS` to the exact frontend origin shown in that device's browser (for example `http://192.168.1.40:5173`).
 
-Mock OTPs are returned only when both `APP_ENV=development` and `DEV_OTP_MODE=true`. To test email delivery, set `DEV_OTP_MODE=false` and configure the real SMTP values. Production OTP delivery never includes the OTP in the API response. Never use the development mock in a deployed environment.
+Mock OTPs are returned only when both `APP_ENV=development` and `DEV_OTP_MODE=true`. To test email delivery, set `DEV_OTP_MODE=false`, choose `EMAIL_PROVIDER=mailjet`, and configure Mailjet's API keys and an active sender address. Email is sent through Mailjet's HTTPS API; ONPay does not use SMTP. Production OTP delivery never includes the OTP in the API response. Never use the development mock in a deployed environment.
 
 ## Configuration
 
@@ -67,6 +67,6 @@ npm test
 npm run build
 ```
 
-The test suites use mock SMTP, geocoding, and payment behavior; they do not send email, request device GPS, open a camera, or move real money.
+The test suites mock email API, geocoding, and payment behavior; they do not send email, request device GPS, open a camera, or move real money.
 
 For real-money use, obtain a supported payment provider with server-side authoritative settlement callbacks, review applicable Indian payment and privacy requirements with qualified professionals, and complete security and reconciliation reviews.
