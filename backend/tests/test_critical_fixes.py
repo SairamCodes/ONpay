@@ -18,6 +18,7 @@ os.environ["FRONTEND_ORIGINS"] = "https://onpay.example.test,https://preview.onp
 from fastapi import HTTPException, Response
 from starlette.datastructures import Headers
 from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
 
 from app.config import Settings, settings
 from app.database import Base, SessionLocal, engine
@@ -28,7 +29,7 @@ from app.main import (
     verify_otp,
 )
 from app.models import Exchange, Listing, OTPChallenge, Subscription, User, now_utc
-from app.security import create_session, hash_otp
+from app.security import create_session, current_user, hash_otp
 from app.schemas import ListingCreate, OTPRequest, OTPVerify
 
 
@@ -521,6 +522,24 @@ class CriticalFixTests(unittest.TestCase):
         cleared_cookie = logout_response.headers["set-cookie"].lower()
         self.assertIn("secure", cleared_cookie)
         self.assertIn("samesite=none", cleared_cookie)
+
+    def test_production_session_cookie_defaults_to_none_and_secure(self):
+        settings.app_env = "production"
+        settings.session_cookie_samesite = None
+        response = Response()
+        create_session(response, self.db, self.requester)
+        cookie = response.headers["set-cookie"].lower()
+        self.assertIn("secure", cookie)
+        self.assertIn("samesite=none", cookie)
+
+    def test_protected_authentication_still_rejects_a_missing_session_cookie(self):
+        request = Request({
+            "type": "http", "method": "POST", "scheme": "https", "path": "/api/listings",
+            "query_string": b"", "headers": [],
+        })
+        with self.assertRaises(HTTPException) as failure:
+            current_user(request, self.db)
+        self.assertEqual(failure.exception.status_code, 401)
 
     def test_production_email_requires_mailjet_configuration(self):
         settings.app_env = "production"

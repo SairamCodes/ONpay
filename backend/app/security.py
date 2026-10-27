@@ -14,6 +14,14 @@ from .models import LoginSession, User, now_utc
 COOKIE_NAME = "onpay_session"
 
 
+def session_cookie_policy() -> tuple[str, bool]:
+    same_site = settings.session_cookie_samesite
+    if same_site is None:
+        same_site = "lax" if settings.app_env.lower() == "development" else "none"
+    secure_cookie = settings.app_env.lower() != "development" or same_site == "none"
+    return same_site, secure_cookie
+
+
 def new_id() -> str:
     return str(uuid4())
 
@@ -28,8 +36,7 @@ def hash_otp(value: str) -> str:
 
 def create_session(response: Response, db: Session, user: User) -> None:
     token = secrets.token_urlsafe(40)
-    same_site = settings.session_cookie_samesite
-    secure_cookie = settings.app_env != "development" or same_site == "none"
+    same_site, secure_cookie = session_cookie_policy()
     session = LoginSession(
         id=new_id(), user_id=user.id, token_hash=hash_value(token),
         expires_at=now_utc() + timedelta(hours=settings.session_ttl_hours),

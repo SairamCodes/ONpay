@@ -35,7 +35,7 @@ from .schemas import (
     AcceptListing, ArrivalUpdate, BlockCreate, CashConfirmation, ListingCreate, ListingUpdate,
     MessageCreate, OTPRequest, OTPVerify, PaymentCreate, ProfileUpdate, ReconciliationRequest, ReportCreate,
 )
-from .security import COOKIE_NAME, create_session, current_user, hash_otp, hash_value, new_id
+from .security import COOKIE_NAME, create_session, current_user, hash_otp, hash_value, new_id, session_cookie_policy
 
 app = FastAPI(title="ONPay API", version="0.1.0", description="Student cash exchange coordination API")
 
@@ -798,8 +798,7 @@ def logout(request: Request, response: Response, db: Session = Depends(get_db)):
         if session:
             db.delete(session)
             db.commit()
-    same_site = settings.session_cookie_samesite
-    secure_cookie = settings.app_env != "development" or same_site == "none"
+    same_site, secure_cookie = session_cookie_policy()
     response.delete_cookie(COOKIE_NAME, path="/", httponly=True, secure=secure_cookie, samesite=same_site)
     return {"ok": True}
 

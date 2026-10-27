@@ -2,6 +2,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 're
 import type { ReactNode } from 'react'
 import type { BrowserQRCodeReader as BrowserQRCodeReaderType, IScannerControls } from '@zxing/browser'
 import { api, ApiError, json, patch } from './api'
+import { getAuthState, restoreAuthSession } from './auth-session.js'
 import { detectCurrentLocation, saveManualLocation } from './location.js'
 import type { ResolvedLocation } from './location.js'
 import { parseUpiPayload } from './upi.js'
@@ -143,7 +144,7 @@ function AuthForm({ intent, onOtp, onChangeIntent, busy, setError }: { intent: '
   </main>
 }
 
-function VerifyScreen({ challenge, onBack, onSuccess, onChallenge, setError }: { challenge: any; onBack: () => void; onSuccess: (user: User) => void; onChallenge: (challenge: any) => void; setError: (message: string) => void }) {
+function VerifyScreen({ challenge, onBack, onSuccess, onChallenge, setError }: { challenge: any; onBack: () => void; onSuccess: () => Promise<void>; onChallenge: (challenge: any) => void; setError: (message: string) => void }) {
   const [code, setCode] = useState(challenge?.development_code || '')
   const [busy, setBusy] = useState(false)
   const [resending, setResending] = useState(false)
@@ -155,7 +156,7 @@ function VerifyScreen({ challenge, onBack, onSuccess, onChallenge, setError }: {
   }, [challenge?.challenge_id, challenge?.resend_in_seconds])
   const verify = async (event: FormEvent) => {
     event.preventDefault(); setError(''); setBusy(true)
-    try { const result = await api('/api/auth/otp/verify', json({ challenge_id: challenge.challenge_id, code })); onSuccess(result.user) }
+    try { await api('/api/auth/otp/verify', json({ challenge_id: challenge.challenge_id, code })); await onSuccess() }
     catch (error) { setError(error instanceof Error ? error.message : 'Could not verify that code.') } finally { setBusy(false) }
   }
   const resend = async () => {
@@ -205,19 +206,28 @@ export default function App() {
   const [unreadCount, setUnreadCount] = useState(0)
 
   useEffect(() => {
-    api('/api/auth/me').then((data) => {
-      setUser(data.user)
-      const savedLocation = data.user.location_label || ''
-      setLocationLabel(savedLocation)
-      if (savedLocation) localStorage.setItem('onpay-location', savedLocation)
-      else localStorage.removeItem('onpay-location')
-      const allowed: Screen[] = ['home', 'matches', 'chats', 'scan', 'transactions', 'profile', 'need', 'have', 'meetup', 'notifications', 'subscriptions', 'points', 'location', 'help']
-      const destination = window.location.hash.slice(1) as Screen
-      setScreen(allowed.includes(destination) ? destination : 'home')
-      api('/api/notifications').then((notifications) => setUnreadCount(notifications.unread_count)).catch(() => setUnreadCount(0))
-    }).catch((failure) => {
-      if (!(failure instanceof ApiError && failure.status === 401)) setError('The ONPay service is unavailable. Start the API and try again.')
-    }).finally(() => setReady(true))
+    let active = true
+    const restore = async () => {
+      const session = await restoreAuthSession<User>((path) => api(path))
+      if (!active) return
+      if (session.status === 'authenticated') {
+        const restoredUser = session.user
+        setUser(restoredUser)
+        const savedLocation = restoredUser.location_label || ''
+        setLocationLabel(savedLocation)
+        if (savedLocation) localStorage.setItem('onpay-location', savedLocation)
+        else localStorage.removeItem('onpay-location')
+        const allowed: Screen[] = ['home', 'matches', 'chats', 'scan', 'transactions', 'profile', 'need', 'have', 'meetup', 'notifications', 'subscriptions', 'points', 'location', 'help']
+        const destination = window.location.hash.slice(1) as Screen
+        setScreen(allowed.includes(destination) ? destination : 'home')
+        api('/api/notifications').then((notifications) => setUnreadCount(notifications.unread_count)).catch(() => setUnreadCount(0))
+      } else if (session.status === 'error') {
+        setError('The ONPay service is unavailable. Start the API and try again.')
+      }
+      setReady(true)
+    }
+    void restore()
+    return () => { active = false }
   }, [])
 
   const refreshLocation = useCallback(() => {
@@ -268,15 +278,25 @@ export default function App() {
   }, [user?.id, screen, refreshLocation])
 
   const navigate = useCallback((next: Screen) => { setScreen(next); setError(''); window.location.hash = next }, [])
-  const signIn = (nextUser: User) => { setUser(nextUser); setLocationLabel(nextUser.location_label || ''); setGeoCoordinates(null); setGeoDetails(null); setGeoLabel(''); setGeoStatus('checking'); setScreen('home'); setChallenge(null); setError(''); window.location.hash = 'home' }
+  const signIn = async () => {
+    const session = await restoreAuthSession<User>((path) => api(path))
+    if (session.status !== 'authenticated') {
+      if (session.status === 'error' && session.error instanceof Error) throw session.error
+      throw new ApiError('ONPay could not confirm your sign-in session. Please try again.', 401)
+    }
+    const nextUser = session.user
+    setUser(nextUser); setLocationLabel(nextUser.location_label || ''); setGeoCoordinates(null); setGeoDetails(null); setGeoLabel(''); setGeoStatus('checking'); setScreen('home'); setChallenge(null); setError(''); window.location.hash = 'home'
+  }
   const signOut = async () => { try { await api('/api/auth/logout', { method: 'POST' }) } catch {} setUser(null); setGeoCoordinates(null); setGeoDetails(null); setGeoLabel(''); setScreen('welcome'); setPayment(null); window.location.hash = '' }
   const saveLocation = async (label: string) => {
     try { await api('/api/location/settings', patch({ label })); setLocationLabel(label); if (label) localStorage.setItem('onpay-location', label); else localStorage.removeItem('onpay-location'); setError('') }
     catch (failure) { const message = failure instanceof Error ? failure.message : 'Could not save location'; setError(message); throw failure }
   }
 
-  if (!ready) return <div className="loading-screen"><Brand/><span className="spinner"/></div>
-  if (!user) return <div className="app-outer"><Notice message={error} onClose={() => setError('')}/>{screen === 'verify' && challenge ? <VerifyScreen challenge={challenge} setError={setError} onChallenge={setChallenge} onBack={() => navigate(authIntent)} onSuccess={signIn}/> : screen === 'signup' || screen === 'login' ? <AuthForm intent={screen} busy={busy} setError={setError} onChangeIntent={(intent) => { setAuthIntent(intent); navigate(intent) }} onOtp={(nextChallenge) => { setChallenge(nextChallenge); setAuthIntent(nextChallenge.intent); navigate('verify') }}/> : <Welcome onStart={() => { setAuthIntent('signup'); navigate('signup') }} onLogin={() => { setAuthIntent('login'); navigate('login') }}/>}</div>
+  const authState = getAuthState(ready, user)
+  if (authState === 'loading') return <div className="loading-screen"><Brand/><span className="spinner"/></div>
+  if (authState === 'unauthenticated') return <div className="app-outer"><Notice message={error} onClose={() => setError('')}/>{screen === 'verify' && challenge ? <VerifyScreen challenge={challenge} setError={setError} onChallenge={setChallenge} onBack={() => navigate(authIntent)} onSuccess={signIn}/> : screen === 'signup' || screen === 'login' ? <AuthForm intent={screen} busy={busy} setError={setError} onChangeIntent={(intent) => { setAuthIntent(intent); navigate(intent) }} onOtp={(nextChallenge) => { setChallenge(nextChallenge); setAuthIntent(nextChallenge.intent); navigate('verify') }}/> : <Welcome onStart={() => { setAuthIntent('signup'); navigate('signup') }} onLogin={() => { setAuthIntent('login'); navigate('login') }}/>}</div>
+  if (!user) return <div className="loading-screen"><Brand/><span className="spinner"/></div>
 
   const activeNav: Screen = screen === 'need' || screen === 'have' || screen === 'matches' || screen === 'student' ? 'home' : screen === 'meetup' || screen === 'payment' ? 'transactions' : screen
   return <div className="app-outer">

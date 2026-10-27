@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     frontend_origin: str = "http://localhost:5173"
     frontend_origins: str = ""
     session_ttl_hours: int = 168
-    session_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
+    session_cookie_samesite: Literal["lax", "strict", "none"] | None = None
     otp_ttl_minutes: int = 5
     otp_resend_seconds: int = 30
     otp_max_attempts: int = 5
