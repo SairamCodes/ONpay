@@ -217,7 +217,9 @@ class CriticalFixTests(unittest.TestCase):
         log_message = "\n".join(delivery_logs.output)
         self.assertIn("provider=mailjet", log_message)
         self.assertIn("attempted=true", log_message)
+        self.assertIn("eligibility=eligible", log_message)
         self.assertIn("http_status=200", log_message)
+        self.assertIn("OTP email provider accepted", log_message)
         for sensitive_value in (
             "123456", "student@example.edu", "test_mailjet_public_key_not_real",
             "test_mailjet_secret_key_not_real",
@@ -243,6 +245,7 @@ class CriticalFixTests(unittest.TestCase):
         log_message = "\n".join(logs.output)
         self.assertIn("provider=mailjet", log_message)
         self.assertIn("http_status=401", log_message)
+        self.assertIn("error_message=", log_message)
         self.assertIn("HTTPStatusError", log_message)
         for sensitive_value in (contact, "123456", "test_mailjet_public_key_not_real", "test_mailjet_secret_key_not_real"):
             self.assertNotIn(sensitive_value, log_message)
@@ -252,7 +255,16 @@ class CriticalFixTests(unittest.TestCase):
         settings.dev_otp_mode = False
         self._configure_mailjet()
         contact = "mailjet-message-rejected@example.edu"
-        response = self._mailjet_response(payload={"Messages": [{"Status": "error", "Errors": [{"ErrorMessage": "sender rejected"}]}]})
+        response = self._mailjet_response(payload={"Messages": [{
+            "Status": "error",
+            "Errors": [{
+                "ErrorCode": "mj-401",
+                "ErrorMessage": (
+                    f"sender rejected for {contact}; code=123456; "
+                    "secret_key=test_mailjet_secret_key_not_real"
+                ),
+            }],
+        }]})
         with patch("app.main.secrets.randbelow", return_value=123456), patch(
             "app.main.httpx.post", return_value=response,
         ), self.assertLogs("onpay.auth", level="WARNING") as logs, self.assertRaises(HTTPException) as failure:
@@ -261,7 +273,14 @@ class CriticalFixTests(unittest.TestCase):
         challenge = self.db.query(OTPChallenge).filter_by(contact=contact).one()
         self.assertEqual(challenge.delivery_status, "failed")
         self.assertIsNone(challenge.code_hash)
-        self.assertIn("reason=message_not_accepted", "\n".join(logs.output))
+        log_message = "\n".join(logs.output)
+        self.assertIn("reason=message_not_accepted", log_message)
+        self.assertIn("error_code=mj-401", log_message)
+        self.assertIn("error_message=sender rejected", log_message)
+        for sensitive_value in (
+            contact, "123456", "test_mailjet_public_key_not_real", "test_mailjet_secret_key_not_real",
+        ):
+            self.assertNotIn(sensitive_value, log_message)
 
     def test_mailjet_requires_both_credentials(self):
         settings.app_env = "production"
@@ -583,6 +602,27 @@ class CriticalFixTests(unittest.TestCase):
         self.assertIn("provider=mailjet", log_message)
         self.assertIn("attempted=false", log_message)
         self.assertIn("reason=ineligible", log_message)
+        self.assertIn("intent=login", log_message)
+        self.assertIn("eligibility=suppressed", log_message)
+
+    def test_existing_signup_is_suppressed_without_mailjet(self):
+        settings.app_env = "production"
+        settings.dev_otp_mode = False
+        self._configure_mailjet()
+        contact = "riya@example.edu"
+        with patch("app.main.httpx.post") as send, self.assertLogs("onpay.auth", level="INFO") as logs:
+            result = request_otp(OTPRequest(
+                channel="email", contact=contact, intent="signup", full_name="Duplicate Student",
+            ), self.db)
+        self.assertTrue(result["accepted"])
+        send.assert_not_called()
+        challenge = self.db.query(OTPChallenge).filter_by(contact=contact, intent="signup").one()
+        self.assertEqual(challenge.delivery_status, "suppressed")
+        log_message = "\n".join(logs.output)
+        self.assertIn("intent=signup", log_message)
+        self.assertIn("eligibility=suppressed", log_message)
+        self.assertIn("attempted=false", log_message)
+        self.assertNotIn(contact, log_message)
 
     def test_otp_verification_attempt_limit_is_enforced(self):
         with patch("app.main.secrets.randbelow", return_value=123456):

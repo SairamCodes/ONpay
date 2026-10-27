@@ -164,6 +164,83 @@ def _safe_brevo_error_message(response: httpx.Response, contact: str, code: str)
     return safe_message[:240] or "unavailable"
 
 
+def _safe_mailjet_error_details(response: httpx.Response, contact: str, code: str) -> str:
+    """Extract provider error metadata while redacting anything user-specific or secret."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return "unavailable"
+    if not isinstance(payload, dict):
+        return "unavailable"
+
+    provider_errors = []
+    if any(key in payload for key in ("ErrorCode", "ErrorIdentifier", "ErrorMessage")):
+        provider_errors.append(payload)
+    messages = payload.get("Messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            errors = message.get("Errors")
+            if isinstance(errors, list):
+                provider_errors.extend(error for error in errors if isinstance(error, dict))
+
+    if not provider_errors:
+        return "unavailable"
+
+    _, sender_address = parseaddr(settings.email_from)
+    credentials = (
+        settings.mailjet_api_key.strip(), settings.mailjet_secret_key.strip(),
+        base64.b64encode(
+            f"{settings.mailjet_api_key.strip()}:{settings.mailjet_secret_key.strip()}".encode(),
+        ).decode(),
+    )
+    sensitive_values = tuple(
+        value for value in (
+            *credentials, settings.email_from, sender_address, contact, code,
+        ) if value
+    )
+
+    error_codes = []
+    error_messages = []
+    for error in provider_errors[:3]:
+        raw_error_code = error.get("ErrorCode") or error.get("ErrorIdentifier")
+        if isinstance(raw_error_code, (str, int)) and not isinstance(raw_error_code, bool):
+            raw_code_text = str(raw_error_code).strip()
+            if (
+                raw_code_text and "@" not in raw_code_text
+                and not re.search(r"\b\d{6}\b", raw_code_text)
+                and not any(secret in raw_code_text for secret in sensitive_values)
+            ):
+                normalized_code = re.sub(r"[^A-Za-z0-9_.-]", "", raw_code_text)[:80]
+            else:
+                normalized_code = ""
+            if normalized_code and normalized_code not in error_codes:
+                error_codes.append(normalized_code)
+        raw_message = error.get("ErrorMessage")
+        if isinstance(raw_message, str) and raw_message.strip():
+            error_messages.append(raw_message.strip())
+
+    safe_message = "; ".join(error_messages) or "unavailable"
+    for sensitive_value in sensitive_values:
+        safe_message = safe_message.replace(sensitive_value, "[redacted]")
+    safe_message = re.sub(
+        r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", "[redacted-email]", safe_message,
+    )
+    safe_message = re.sub(r"\b\d{6}\b", "[redacted-code]", safe_message)
+    safe_message = re.sub(
+        r"(?i)\b(?:authorization|api[-_ ]?key|secret[-_ ]?key|password)\s*[:=]\s*[^\s,;]+",
+        "credential=[redacted]", safe_message,
+    )
+    safe_message = re.sub(r"(?i)\bbearer\s+[^\s,;]+", "Bearer [redacted]", safe_message)
+    safe_message = re.sub(r"[\x00-\x1f\x7f\u2028\u2029]+", " ", safe_message)
+    parts = []
+    if error_codes:
+        parts.append("error_code=" + ",".join(error_codes))
+    parts.append("error_message=" + (safe_message[:240] or "unavailable"))
+    return " ".join(parts)
+
+
 def deliver_otp(channel: str, contact: str, code: str, challenge_id: str | None = None) -> str | None:
     if settings.app_env == "development" and settings.dev_otp_mode:
         logger.info(
@@ -180,7 +257,15 @@ def deliver_otp(channel: str, contact: str, code: str, challenge_id: str | None 
     )
     configuration_error = email_delivery_configuration_error()
     if configuration_error:
+        logger.warning(
+            "OTP email request not attempted challenge_id=%s provider=%s reason=configuration_missing",
+            challenge_id, settings.email_provider,
+        )
         raise HTTPException(503, configuration_error)
+    logger.info(
+        "OTP email provider configuration accepted challenge_id=%s provider=%s sender_configured=true",
+        challenge_id, settings.email_provider,
+    )
     subject = "Your ONPay sign-in code"
     text_content = f"Your ONPay verification code is {code}. It expires in {settings.otp_ttl_minutes} minutes."
     if settings.email_provider == "mailjet":
@@ -254,8 +339,9 @@ def deliver_otp(channel: str, contact: str, code: str, challenge_id: str | None 
     )
     if settings.email_provider == "mailjet" and not response.is_success:
         logger.warning(
-            "OTP email provider rejected request challenge_id=%s provider=mailjet http_status=%s reason=http_error",
+            "OTP email provider rejected request challenge_id=%s provider=mailjet http_status=%s reason=http_error %s",
             challenge_id, response.status_code,
+            _safe_mailjet_error_details(response, contact, code),
         )
     elif settings.email_provider == "brevo" and not response.is_success:
         logger.warning(
@@ -284,8 +370,9 @@ def deliver_otp(channel: str, contact: str, code: str, challenge_id: str | None 
             raw_email_id = recipient_result.get("MessageUUID") or recipient_result.get("MessageID")
         if not isinstance(message_result, dict) or message_result.get("Status") != "success":
             logger.warning(
-                "OTP email provider rejected request challenge_id=%s provider=mailjet http_status=%s reason=message_not_accepted",
+                "OTP email provider rejected request challenge_id=%s provider=mailjet http_status=%s reason=message_not_accepted %s",
                 challenge_id, response.status_code,
+                _safe_mailjet_error_details(response, contact, code),
             )
             raise RuntimeError("Mailjet did not accept the email")
         if isinstance(raw_email_id, bool) or not isinstance(raw_email_id, (str, int)) or not str(raw_email_id).strip():
@@ -557,6 +644,10 @@ def request_otp(payload: OTPRequest, db: Session = Depends(get_db)):
         expires_at=now_utc() + timedelta(minutes=settings.otp_ttl_minutes),
     )
     challenge_id = challenge.id
+    logger.info(
+        "OTP request eligibility evaluated challenge_id=%s channel=%s intent=%s eligibility=%s",
+        challenge_id, payload.channel, payload.intent, "eligible" if eligible else "suppressed",
+    )
     if not eligible:
         logger.info(
             "OTP delivery skipped challenge_id=%s provider=%s channel=%s intent=%s attempted=false reason=ineligible",
@@ -565,6 +656,10 @@ def request_otp(payload: OTPRequest, db: Session = Depends(get_db)):
         )
     db.add(challenge)
     db.commit()
+    logger.info(
+        "OTP challenge persisted challenge_id=%s channel=%s intent=%s delivery_status=%s",
+        challenge_id, payload.channel, payload.intent, challenge.delivery_status,
+    )
     if eligible:
         try:
             provider_ref = deliver_otp(payload.channel, contact, code, challenge_id=challenge_id)
