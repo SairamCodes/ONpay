@@ -130,7 +130,7 @@ class CriticalFixTests(unittest.TestCase):
         self._configure_brevo()
         with patch("app.main.secrets.randbelow", return_value=123456), patch(
             "app.main.httpx.post", return_value=self._brevo_response(payload={"messageId": "brevo-message-id"}),
-        ) as send:
+        ) as send, self.assertLogs("onpay.auth", level="INFO") as delivery_logs:
             result = request_otp(OTPRequest(
                 channel="email", contact="brevo-user@example.edu", intent="signup", full_name="Brevo Student",
             ), self.db)
@@ -149,6 +149,13 @@ class CriticalFixTests(unittest.TestCase):
         challenge = self.db.get(OTPChallenge, result["challenge_id"])
         self.assertEqual(challenge.delivery_status, "sent")
         self.assertEqual(challenge.provider_ref, "brevo-message-id")
+        log_message = "\n".join(delivery_logs.output)
+        self.assertIn("provider=brevo", log_message)
+        self.assertIn("attempted=true", log_message)
+        self.assertIn("http_status=201", log_message)
+        self.assertNotIn("123456", log_message)
+        self.assertNotIn("brevo-user@example.edu", log_message)
+        self.assertNotIn("test_brevo_key_not_real", log_message)
 
     def test_brevo_api_error_fails_challenge_without_sensitive_logs(self):
         settings.app_env = "production"
@@ -156,7 +163,9 @@ class CriticalFixTests(unittest.TestCase):
         self._configure_brevo()
         contact = "brevo-rejected@example.edu"
         with patch("app.main.secrets.randbelow", return_value=123456), patch(
-            "app.main.httpx.post", return_value=self._brevo_response(401, {"message": "invalid api key"}),
+            "app.main.httpx.post", return_value=self._brevo_response(401, {
+                "message": f"Invalid API key for {contact}; code 123456; Authorization: Bearer test_brevo_key_not_real",
+            }),
         ), self.assertLogs("onpay.auth", level="WARNING") as logs, self.assertRaises(HTTPException) as failure:
             request_otp(OTPRequest(channel="email", contact=contact, intent="signup", full_name="Rejected Student"), self.db)
         self.assertEqual(failure.exception.status_code, 502)
@@ -167,7 +176,8 @@ class CriticalFixTests(unittest.TestCase):
         log_message = "\n".join(logs.output)
         self.assertIn("provider=brevo", log_message)
         self.assertIn("provider_status=401", log_message)
-        for sensitive_value in (contact, "123456", "test_brevo_key_not_real", "invalid api key"):
+        self.assertIn("error_message=Invalid API key for [redacted]", log_message)
+        for sensitive_value in (contact, "123456", "test_brevo_key_not_real", "Authorization: Bearer"):
             self.assertNotIn(sensitive_value, log_message)
 
     def test_brevo_timeout_fails_challenge_safely(self):
@@ -296,7 +306,7 @@ class CriticalFixTests(unittest.TestCase):
         settings.app_env = "production"
         settings.dev_otp_mode = False
 
-        def verify_persisted_challenge(channel, contact, code):
+        def verify_persisted_challenge(channel, contact, code, challenge_id=None):
             challenge = self.db.query(OTPChallenge).filter_by(contact=contact).one()
             self.assertEqual(challenge.delivery_status, "pending")
             self.assertEqual(challenge.code_hash, hash_otp(code))
@@ -437,6 +447,25 @@ class CriticalFixTests(unittest.TestCase):
         self.db.commit()
         with self.assertRaises(HTTPException):
             verify_otp(OTPVerify(challenge_id=row.id, code=challenge["development_code"]), Response(), self.db)
+
+    def test_ineligible_login_is_accepted_but_suppressed_without_brevo(self):
+        settings.app_env = "production"
+        settings.dev_otp_mode = False
+        self._configure_brevo()
+        with patch("app.main.httpx.post") as send, self.assertLogs("onpay.auth", level="INFO") as logs:
+            result = request_otp(OTPRequest(
+                channel="email", contact="not-registered@example.edu", intent="login",
+            ), self.db)
+        self.assertTrue(result["accepted"])
+        self.assertNotIn("development_code", result)
+        self.assertIn("200", fastapi_app.openapi()["paths"]["/api/auth/otp/request"]["post"]["responses"])
+        send.assert_not_called()
+        challenge = self.db.query(OTPChallenge).filter_by(contact="not-registered@example.edu").one()
+        self.assertEqual(challenge.delivery_status, "suppressed")
+        log_message = "\n".join(logs.output)
+        self.assertIn("provider=brevo", log_message)
+        self.assertIn("attempted=false", log_message)
+        self.assertIn("reason=ineligible", log_message)
 
     def test_otp_verification_attempt_limit_is_enforced(self):
         with patch("app.main.secrets.randbelow", return_value=123456):

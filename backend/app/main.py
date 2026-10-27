@@ -130,12 +130,49 @@ def email_delivery_configuration_error() -> str | None:
     return None
 
 
-def deliver_otp(channel: str, contact: str, code: str) -> str | None:
+def _safe_brevo_error_message(response: httpx.Response, contact: str, code: str) -> str:
+    try:
+        payload = response.json()
+    except ValueError:
+        return "unavailable"
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if not isinstance(message, str) or not message.strip():
+        return "unavailable"
+
+    safe_message = message.strip()
+    _, sender_address = parseaddr(settings.email_from)
+    for sensitive_value in (settings.brevo_api_key, settings.email_from, sender_address, contact, code):
+        if sensitive_value:
+            safe_message = safe_message.replace(sensitive_value, "[redacted]")
+    safe_message = re.sub(
+        r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", "[redacted-email]", safe_message,
+    )
+    safe_message = re.sub(r"\b\d{6}\b", "[redacted-code]", safe_message)
+    safe_message = re.sub(
+        r"(?i)\bauthorization\s*[:=]\s*(?:bearer\s+)?[^\s,;]+", "authorization=[redacted]", safe_message,
+    )
+    safe_message = re.sub(
+        r"(?i)\b(api[-_ ]?key)\s*[:=]\s*[^\s,;]+", r"\1=[redacted]", safe_message,
+    )
+    safe_message = re.sub(r"(?i)\bbearer\s+[^\s,;]+", "Bearer [redacted]", safe_message)
+    safe_message = re.sub(r"[\x00-\x1f\x7f]+", " ", safe_message)
+    return safe_message[:240] or "unavailable"
+
+
+def deliver_otp(channel: str, contact: str, code: str, challenge_id: str | None = None) -> str | None:
     if settings.app_env == "development" and settings.dev_otp_mode:
+        logger.info(
+            "OTP delivery selected challenge_id=%s provider=development_mock attempted=false",
+            challenge_id,
+        )
         return "development-mock"
     if channel == "mobile":
         # Twilio Verify generates and delivers its own code; the local code is not used.
         return send_sms_verify(contact, "Verifications")
+    logger.info(
+        "OTP email provider selected challenge_id=%s provider=%s attempted=false",
+        challenge_id, settings.email_provider,
+    )
     configuration_error = email_delivery_configuration_error()
     if configuration_error:
         raise HTTPException(503, configuration_error)
@@ -170,23 +207,55 @@ def deliver_otp(channel: str, contact: str, code: str) -> str | None:
             "subject": subject,
             "text": text_content,
         }
-    response = httpx.post(
-        endpoint,
-        headers=headers,
-        json=body,
-        timeout=EMAIL_REQUEST_TIMEOUT_SECONDS,
+    logger.info(
+        "OTP email request started challenge_id=%s provider=%s attempted=true",
+        challenge_id, settings.email_provider,
     )
+    try:
+        response = httpx.post(
+            endpoint,
+            headers=headers,
+            json=body,
+            timeout=EMAIL_REQUEST_TIMEOUT_SECONDS,
+        )
+    except httpx.RequestError as exc:
+        logger.warning(
+            "OTP email request failed challenge_id=%s provider=%s attempted=true error_type=%s",
+            challenge_id, settings.email_provider, type(exc).__name__,
+        )
+        raise
+    logger.info(
+        "OTP email provider response challenge_id=%s provider=%s http_status=%s",
+        challenge_id, settings.email_provider, response.status_code,
+    )
+    if settings.email_provider == "brevo" and not response.is_success:
+        logger.warning(
+            "OTP email provider rejected request challenge_id=%s provider=brevo http_status=%s error_message=%s",
+            challenge_id, response.status_code, _safe_brevo_error_message(response, contact, code),
+        )
     response.raise_for_status()
     try:
         result = response.json()
     except ValueError as exc:
         provider_name = "Brevo" if settings.email_provider == "brevo" else "Resend"
+        logger.warning(
+            "OTP email provider acceptance response invalid challenge_id=%s provider=%s http_status=%s reason=invalid_json",
+            challenge_id, settings.email_provider, response.status_code,
+        )
         raise RuntimeError(f"{provider_name} returned an invalid acceptance response") from exc
     response_id_field = "messageId" if settings.email_provider == "brevo" else "id"
     email_id = result.get(response_id_field) if isinstance(result, dict) else None
     if not isinstance(email_id, str) or not email_id.strip():
         provider_name = "Brevo" if settings.email_provider == "brevo" else "Resend"
+        logger.warning(
+            "OTP email provider acceptance response invalid challenge_id=%s provider=%s http_status=%s reason=missing_message_id",
+            challenge_id, settings.email_provider, response.status_code,
+        )
         raise RuntimeError(f"{provider_name} returned an invalid acceptance response")
+    logger.info(
+        "OTP email provider accepted challenge_id=%s provider=%s http_status=%s",
+        challenge_id, settings.email_provider, response.status_code,
+    )
     return email_id
 
 
@@ -435,11 +504,17 @@ def request_otp(payload: OTPRequest, db: Session = Depends(get_db)):
         expires_at=now_utc() + timedelta(minutes=settings.otp_ttl_minutes),
     )
     challenge_id = challenge.id
+    if not eligible:
+        logger.info(
+            "OTP delivery skipped challenge_id=%s provider=%s channel=%s intent=%s attempted=false reason=ineligible",
+            challenge_id, "twilio" if payload.channel == "mobile" else settings.email_provider,
+            payload.channel, payload.intent,
+        )
     db.add(challenge)
     db.commit()
     if eligible:
         try:
-            provider_ref = deliver_otp(payload.channel, contact, code)
+            provider_ref = deliver_otp(payload.channel, contact, code, challenge_id=challenge_id)
         except Exception as exc:
             try:
                 _record_failed_otp_delivery(db, challenge_id)
