@@ -6,6 +6,8 @@ import logging
 import math
 import re
 import secrets
+import smtplib
+import ssl
 import threading
 import time
 import urllib.error
@@ -13,6 +15,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from email.message import EmailMessage
 from email.utils import parseaddr
 from uuid import uuid4
 
@@ -118,10 +121,19 @@ def send_sms_verify(contact: str, action: str) -> str:
 
 
 def email_delivery_configuration_error() -> str | None:
-    if settings.email_provider not in ("resend", "brevo"):
+    if settings.email_provider not in ("resend", "brevo", "smtp"):
         return "The configured email provider is not supported"
+    if settings.email_provider == "smtp":
+        if not settings.smtp_host.strip():
+            return "Email OTP delivery requires an SMTP host"
+        if settings.smtp_port != 587:
+            return "Email OTP delivery requires SMTP port 587"
+        if not settings.smtp_starttls:
+            return "Email OTP delivery requires STARTTLS"
+        if not settings.smtp_username.strip() or not settings.smtp_password:
+            return "Email OTP delivery requires SMTP credentials"
     api_key = settings.brevo_api_key if settings.email_provider == "brevo" else settings.resend_api_key
-    if not api_key.strip():
+    if settings.email_provider != "smtp" and not api_key.strip():
         provider_name = "Brevo" if settings.email_provider == "brevo" else "Resend"
         return f"Email OTP delivery requires a {provider_name} API key"
     sender_address = parseaddr(settings.email_from)[1]
@@ -178,6 +190,34 @@ def deliver_otp(channel: str, contact: str, code: str, challenge_id: str | None 
         raise HTTPException(503, configuration_error)
     subject = "Your ONPay sign-in code"
     text_content = f"Your ONPay verification code is {code}. It expires in {settings.otp_ttl_minutes} minutes."
+    if settings.email_provider == "smtp":
+        message = EmailMessage()
+        message["Subject"] = subject
+        message["From"] = settings.email_from
+        message["To"] = contact
+        message.set_content(text_content)
+        logger.info(
+            "OTP email request started challenge_id=%s provider=smtp attempted=true",
+            challenge_id,
+        )
+        try:
+            with smtplib.SMTP(settings.smtp_host.strip(), settings.smtp_port, timeout=10) as server:
+                server.ehlo()
+                server.starttls(context=ssl.create_default_context())
+                server.ehlo()
+                server.login(settings.smtp_username.strip(), settings.smtp_password)
+                server.send_message(message)
+        except Exception as exc:
+            logger.warning(
+                "OTP email request failed challenge_id=%s provider=smtp attempted=true error_type=%s",
+                challenge_id, type(exc).__name__,
+            )
+            raise RuntimeError("SMTP email delivery failed") from exc
+        logger.info(
+            "OTP email provider accepted challenge_id=%s provider=smtp",
+            challenge_id,
+        )
+        return None
     if settings.email_provider == "brevo":
         sender_name, sender_address = parseaddr(settings.email_from)
         sender = {"email": sender_address}
