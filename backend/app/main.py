@@ -200,17 +200,53 @@ def deliver_otp(channel: str, contact: str, code: str, challenge_id: str | None 
             "OTP email request started challenge_id=%s provider=smtp attempted=true",
             challenge_id,
         )
+        smtp_stage = "connect"
         try:
+            logger.info(
+                "OTP SMTP stage started challenge_id=%s provider=smtp stage=connect",
+                challenge_id,
+            )
             with smtplib.SMTP(settings.smtp_host.strip(), settings.smtp_port, timeout=10) as server:
+                logger.info(
+                    "OTP SMTP stage completed challenge_id=%s provider=smtp stage=connect",
+                    challenge_id,
+                )
+                smtp_stage = "starttls"
+                logger.info(
+                    "OTP SMTP stage started challenge_id=%s provider=smtp stage=starttls",
+                    challenge_id,
+                )
                 server.ehlo()
                 server.starttls(context=ssl.create_default_context())
                 server.ehlo()
+                logger.info(
+                    "OTP SMTP stage completed challenge_id=%s provider=smtp stage=starttls",
+                    challenge_id,
+                )
+                smtp_stage = "authenticate"
+                logger.info(
+                    "OTP SMTP stage started challenge_id=%s provider=smtp stage=authenticate",
+                    challenge_id,
+                )
                 server.login(settings.smtp_username.strip(), settings.smtp_password)
+                logger.info(
+                    "OTP SMTP stage completed challenge_id=%s provider=smtp stage=authenticate",
+                    challenge_id,
+                )
+                smtp_stage = "send"
+                logger.info(
+                    "OTP SMTP stage started challenge_id=%s provider=smtp stage=send",
+                    challenge_id,
+                )
                 server.send_message(message)
+                logger.info(
+                    "OTP SMTP stage completed challenge_id=%s provider=smtp stage=send",
+                    challenge_id,
+                )
         except Exception as exc:
             logger.warning(
-                "OTP email request failed challenge_id=%s provider=smtp attempted=true error_type=%s",
-                challenge_id, type(exc).__name__,
+                "OTP email request failed challenge_id=%s provider=smtp attempted=true stage=%s error_type=%s",
+                challenge_id, smtp_stage, type(exc).__name__,
             )
             raise RuntimeError("SMTP email delivery failed") from exc
         logger.info(

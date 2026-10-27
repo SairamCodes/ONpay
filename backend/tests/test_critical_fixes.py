@@ -220,6 +220,8 @@ class CriticalFixTests(unittest.TestCase):
         log_message = "\n".join(delivery_logs.output)
         for sensitive_value in ("123456", "student@example.edu", "test_google_app_password_not_real"):
             self.assertNotIn(sensitive_value, log_message)
+        for stage in ("connect", "starttls", "authenticate", "send"):
+            self.assertIn(f"stage={stage}", log_message)
 
     def test_smtp_failure_marks_challenge_failed_without_sensitive_logs(self):
         settings.app_env = "production"
@@ -228,8 +230,10 @@ class CriticalFixTests(unittest.TestCase):
         contact = "smtp-failed@example.edu"
         with patch("app.main.secrets.randbelow", return_value=123456), patch(
             "app.main.smtplib.SMTP",
-            side_effect=smtplib.SMTPAuthenticationError(535, b"test app password rejected"),
-        ), self.assertLogs("onpay.auth", level="WARNING") as logs, self.assertRaises(HTTPException) as failure:
+        ) as smtp, self.assertLogs("onpay.auth", level="WARNING") as logs, self.assertRaises(HTTPException) as failure:
+            smtp.return_value.__enter__.return_value.login.side_effect = smtplib.SMTPAuthenticationError(
+                535, b"test app password rejected",
+            )
             request_otp(OTPRequest(channel="email", contact=contact, intent="signup", full_name="SMTP Student"), self.db)
         self.assertEqual(failure.exception.status_code, 502)
         challenge = self.db.query(OTPChallenge).filter_by(contact=contact).one()
@@ -239,7 +243,53 @@ class CriticalFixTests(unittest.TestCase):
         log_message = "\n".join(logs.output)
         self.assertIn("provider=smtp", log_message)
         self.assertIn("SMTPAuthenticationError", log_message)
+        self.assertIn("stage=authenticate", log_message)
         for sensitive_value in (contact, "123456", "test_google_app_password_not_real", "test app password rejected"):
+            self.assertNotIn(sensitive_value, log_message)
+
+    def test_smtp_connection_failure_is_reported_and_challenge_is_not_sent(self):
+        settings.app_env = "production"
+        settings.dev_otp_mode = False
+        self._configure_smtp()
+        contact = "smtp-connect-failed@example.edu"
+        with patch("app.main.secrets.randbelow", return_value=123456), patch(
+            "app.main.smtplib.SMTP", side_effect=OSError("private connection diagnostic"),
+        ), self.assertLogs("onpay.auth", level="WARNING") as logs, self.assertRaises(HTTPException) as failure:
+            request_otp(OTPRequest(channel="email", contact=contact, intent="signup", full_name="SMTP Student"), self.db)
+        self.assertEqual(failure.exception.status_code, 502)
+        challenge = self.db.query(OTPChallenge).filter_by(contact=contact).one()
+        self.assertEqual(challenge.delivery_status, "failed")
+        self.assertIsNone(challenge.code_hash)
+        self.assertIsNone(challenge.provider_ref)
+        log_message = "\n".join(logs.output)
+        self.assertIn("provider=smtp", log_message)
+        self.assertIn("stage=connect", log_message)
+        self.assertIn("error_type=OSError", log_message)
+        for sensitive_value in (contact, "123456", "test_google_app_password_not_real", "private connection diagnostic"):
+            self.assertNotIn(sensitive_value, log_message)
+
+    def test_smtp_send_failure_is_reported_and_challenge_is_not_sent(self):
+        settings.app_env = "production"
+        settings.dev_otp_mode = False
+        self._configure_smtp()
+        contact = "smtp-send-failed@example.edu"
+        with patch("app.main.secrets.randbelow", return_value=123456), patch(
+            "app.main.smtplib.SMTP",
+        ) as smtp, self.assertLogs("onpay.auth", level="WARNING") as logs, self.assertRaises(HTTPException) as failure:
+            smtp.return_value.__enter__.return_value.send_message.side_effect = smtplib.SMTPDataError(
+                550, f"rejected {contact}; otp=123456".encode(),
+            )
+            request_otp(OTPRequest(channel="email", contact=contact, intent="signup", full_name="SMTP Student"), self.db)
+        self.assertEqual(failure.exception.status_code, 502)
+        challenge = self.db.query(OTPChallenge).filter_by(contact=contact).one()
+        self.assertEqual(challenge.delivery_status, "failed")
+        self.assertIsNone(challenge.code_hash)
+        self.assertIsNone(challenge.provider_ref)
+        log_message = "\n".join(logs.output)
+        self.assertIn("provider=smtp", log_message)
+        self.assertIn("stage=send", log_message)
+        self.assertIn("error_type=SMTPDataError", log_message)
+        for sensitive_value in (contact, "123456", "test_google_app_password_not_real", "otp=123456"):
             self.assertNotIn(sensitive_value, log_message)
 
     def test_smtp_requires_credentials_tls_and_port_587(self):
