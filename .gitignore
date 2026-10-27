@@ -1,0 +1,32 @@
+
+# Secrets and environment files
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!.env.*.example
+!**/.env.example
+!**/.env.*.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Databases and local data
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite*
+
+# Frontend dependencies and builds
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+
+# Build artifacts
+*.tsbuildinfo
