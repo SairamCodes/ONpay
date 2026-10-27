@@ -21,7 +21,7 @@ from app.database import Base, SessionLocal, engine
 from app.main import (
     app, check_quota, cors_options, create_listing, current_month_bounds, fastapi_app,
     get_listings, haversine_km, health,
-    location_reverse, location_settings, logout, monthly_usage, request_otp, reverse_geocode, set_location, subscriptions,
+    location_reverse, location_settings, logout, monthly_usage, request_otp, reverse_geocode, set_location, startup, subscriptions,
     verify_otp,
 )
 from app.models import Exchange, Listing, OTPChallenge, Subscription, User, now_utc
@@ -35,6 +35,7 @@ class CriticalFixTests(unittest.TestCase):
         settings.dev_otp_mode = True
         settings.email_provider = "resend"
         settings.resend_api_key = ""
+        settings.brevo_api_key = ""
         settings.email_from = ""
         settings.twilio_account_sid = ""
         settings.twilio_auth_token = ""
@@ -59,9 +60,19 @@ class CriticalFixTests(unittest.TestCase):
         settings.resend_api_key = "test_resend_key_not_real"
         settings.email_from = "ONPay <verify@example.test>"
 
+    def _configure_brevo(self):
+        settings.email_provider = "brevo"
+        settings.brevo_api_key = "test_brevo_key_not_real"
+        settings.email_from = "ONPay <verify@example.test>"
+
     @staticmethod
     def _resend_response(status_code=200, payload=None):
         request = httpx.Request("POST", "https://api.resend.com/emails")
+        return httpx.Response(status_code, json=payload, request=request)
+
+    @staticmethod
+    def _brevo_response(status_code=201, payload=None):
+        request = httpx.Request("POST", "https://api.brevo.com/v3/smtp/email")
         return httpx.Response(status_code, json=payload, request=request)
 
     def test_resend_configuration_uses_expected_environment_variable_names(self):
@@ -73,6 +84,17 @@ class CriticalFixTests(unittest.TestCase):
             configured = Settings(_env_file=None)
         self.assertEqual(configured.email_provider, "resend")
         self.assertEqual(configured.resend_api_key, "test_resend_key_not_real")
+        self.assertEqual(configured.email_from, "ONPay <verify@example.test>")
+
+    def test_brevo_configuration_uses_expected_environment_variable_names(self):
+        with patch.dict(os.environ, {
+            "EMAIL_PROVIDER": "brevo",
+            "BREVO_API_KEY": "test_brevo_key_not_real",
+            "EMAIL_FROM": "ONPay <verify@example.test>",
+        }, clear=False):
+            configured = Settings(_env_file=None)
+        self.assertEqual(configured.email_provider, "brevo")
+        self.assertEqual(configured.brevo_api_key, "test_brevo_key_not_real")
         self.assertEqual(configured.email_from, "ONPay <verify@example.test>")
 
     def test_production_email_uses_resend_and_never_returns_code(self):
@@ -101,6 +123,83 @@ class CriticalFixTests(unittest.TestCase):
         self.assertEqual(verify_otp(OTPVerify(challenge_id=challenge.id, code="123456"), Response(), self.db)["user"]["email"], "new@example.edu")
         with self.assertRaises(HTTPException):
             verify_otp(OTPVerify(challenge_id=challenge.id, code="123456"), Response(), self.db)
+
+    def test_production_email_uses_brevo_and_never_returns_code(self):
+        settings.app_env = "production"
+        settings.dev_otp_mode = False
+        self._configure_brevo()
+        with patch("app.main.secrets.randbelow", return_value=123456), patch(
+            "app.main.httpx.post", return_value=self._brevo_response(payload={"messageId": "brevo-message-id"}),
+        ) as send:
+            result = request_otp(OTPRequest(
+                channel="email", contact="brevo-user@example.edu", intent="signup", full_name="Brevo Student",
+            ), self.db)
+        self.assertNotIn("development_code", result)
+        url, = send.call_args.args
+        options = send.call_args.kwargs
+        self.assertEqual(url, "https://api.brevo.com/v3/smtp/email")
+        self.assertEqual(options["headers"]["api-key"], "test_brevo_key_not_real")
+        self.assertNotIn("Authorization", options["headers"])
+        self.assertEqual(options["headers"]["Content-Type"], "application/json")
+        self.assertEqual(options["json"]["sender"], {"name": "ONPay", "email": "verify@example.test"})
+        self.assertEqual(options["json"]["to"], [{"email": "brevo-user@example.edu"}])
+        self.assertEqual(options["json"]["subject"], "Your ONPay sign-in code")
+        self.assertIn("123456", options["json"]["textContent"])
+        self.assertEqual(options["timeout"], 10.0)
+        challenge = self.db.get(OTPChallenge, result["challenge_id"])
+        self.assertEqual(challenge.delivery_status, "sent")
+        self.assertEqual(challenge.provider_ref, "brevo-message-id")
+
+    def test_brevo_api_error_fails_challenge_without_sensitive_logs(self):
+        settings.app_env = "production"
+        settings.dev_otp_mode = False
+        self._configure_brevo()
+        contact = "brevo-rejected@example.edu"
+        with patch("app.main.secrets.randbelow", return_value=123456), patch(
+            "app.main.httpx.post", return_value=self._brevo_response(401, {"message": "invalid api key"}),
+        ), self.assertLogs("onpay.auth", level="WARNING") as logs, self.assertRaises(HTTPException) as failure:
+            request_otp(OTPRequest(channel="email", contact=contact, intent="signup", full_name="Rejected Student"), self.db)
+        self.assertEqual(failure.exception.status_code, 502)
+        challenge = self.db.query(OTPChallenge).filter_by(contact=contact).one()
+        self.assertEqual(challenge.delivery_status, "failed")
+        self.assertIsNone(challenge.code_hash)
+        self.assertIsNone(challenge.provider_ref)
+        log_message = "\n".join(logs.output)
+        self.assertIn("provider=brevo", log_message)
+        self.assertIn("provider_status=401", log_message)
+        for sensitive_value in (contact, "123456", "test_brevo_key_not_real", "invalid api key"):
+            self.assertNotIn(sensitive_value, log_message)
+
+    def test_brevo_timeout_fails_challenge_safely(self):
+        settings.app_env = "production"
+        settings.dev_otp_mode = False
+        self._configure_brevo()
+        contact = "brevo-timeout@example.edu"
+        with patch("app.main.httpx.post", side_effect=httpx.TimeoutException("timeout")), self.assertRaises(HTTPException) as failure:
+            request_otp(OTPRequest(channel="email", contact=contact, intent="signup", full_name="Timeout Student"), self.db)
+        self.assertEqual(failure.exception.status_code, 502)
+        challenge = self.db.query(OTPChallenge).filter_by(contact=contact).one()
+        self.assertEqual(challenge.delivery_status, "failed")
+        self.assertIsNone(challenge.code_hash)
+
+    def test_production_brevo_requires_api_key_and_sender(self):
+        settings.app_env = "production"
+        settings.dev_otp_mode = False
+        configurations = (
+            ("brevo-missing-key@example.edu", "", "ONPay <verify@example.test>"),
+            ("brevo-missing-sender@example.edu", "test_brevo_key_not_real", ""),
+        )
+        for contact, api_key, email_from in configurations:
+            settings.email_provider = "brevo"
+            settings.brevo_api_key = api_key
+            settings.email_from = email_from
+            with self.subTest(contact=contact), patch("app.main.httpx.post") as send, self.assertRaises(HTTPException) as failure:
+                request_otp(OTPRequest(channel="email", contact=contact, intent="signup", full_name="Missing Config"), self.db)
+            self.assertEqual(failure.exception.status_code, 503)
+            send.assert_not_called()
+            challenge = self.db.query(OTPChallenge).filter_by(contact=contact).one()
+            self.assertEqual(challenge.delivery_status, "failed")
+            self.assertIsNone(challenge.code_hash)
 
     def test_resend_provider_rejection_marks_challenge_failed_without_sensitive_logs(self):
         settings.app_env = "production"
@@ -296,6 +395,14 @@ class CriticalFixTests(unittest.TestCase):
         self.assertEqual(rejected.status_code, 400)
         self.assertNotIn("access-control-allow-origin", rejected.headers)
 
+    def test_startup_rejects_development_otp_mode_outside_development(self):
+        settings.app_env = "production"
+        settings.dev_otp_mode = True
+        with patch("app.main.Base.metadata.create_all") as create_all:
+            with self.assertRaisesRegex(RuntimeError, "DEV_OTP_MODE"):
+                startup()
+        create_all.assert_not_called()
+
     def test_development_mock_must_be_explicit_and_resend_has_cooldown(self):
         settings.dev_otp_mode = False
         with self.assertRaises(HTTPException):
@@ -307,7 +414,11 @@ class CriticalFixTests(unittest.TestCase):
         self.assertNotIn("development_code", challenge)
 
         settings.dev_otp_mode = True
-        mocked = request_otp(OTPRequest(channel="email", contact="mock@example.edu", intent="signup", full_name="Mock Student"), self.db)
+        settings.email_provider = "brevo"
+        settings.brevo_api_key = ""
+        with patch("app.main.httpx.post") as send:
+            mocked = request_otp(OTPRequest(channel="email", contact="mock@example.edu", intent="signup", full_name="Mock Student"), self.db)
+        send.assert_not_called()
         self.assertIn("development_code", mocked)
         with self.assertRaises(HTTPException) as limited:
             request_otp(OTPRequest(channel="email", contact="mock@example.edu", intent="signup", full_name="Mock Student"), self.db)

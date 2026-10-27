@@ -15,8 +15,9 @@ class Settings(BaseSettings):
     otp_resend_seconds: int = 30
     otp_max_attempts: int = 5
     dev_otp_mode: bool = False
-    email_provider: Literal["resend"] = "resend"
+    email_provider: Literal["resend", "brevo"] = "resend"
     resend_api_key: str = ""
+    brevo_api_key: str = ""
     email_from: str = ""
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""

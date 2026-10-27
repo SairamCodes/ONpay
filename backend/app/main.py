@@ -39,7 +39,8 @@ from .security import COOKIE_NAME, create_session, current_user, hash_otp, hash_
 app = FastAPI(title="ONPay API", version="0.1.0", description="Student cash exchange coordination API")
 logger = logging.getLogger("onpay.auth")
 RESEND_EMAILS_URL = "https://api.resend.com/emails"
-RESEND_REQUEST_TIMEOUT_SECONDS = 10.0
+BREVO_EMAILS_URL = "https://api.brevo.com/v3/smtp/email"
+EMAIL_REQUEST_TIMEOUT_SECONDS = 10.0
 cors_origins = settings.get_cors_origins()
 cors_options = {
     "allow_origins": cors_origins,
@@ -52,6 +53,8 @@ cors_options = {
 
 @app.on_event("startup")
 def startup() -> None:
+    if settings.app_env != "development" and settings.dev_otp_mode:
+        raise RuntimeError("DEV_OTP_MODE must be false unless APP_ENV=development")
     if settings.app_env != "development" and (settings.secret_key == "development-only-change-me" or len(settings.secret_key) < 32):
         raise RuntimeError("Set a random SECRET_KEY with at least 32 characters outside development mode")
     if settings.app_env != "development" and not cors_origins:
@@ -115,10 +118,12 @@ def send_sms_verify(contact: str, action: str) -> str:
 
 
 def email_delivery_configuration_error() -> str | None:
-    if settings.email_provider != "resend":
+    if settings.email_provider not in ("resend", "brevo"):
         return "The configured email provider is not supported"
-    if not settings.resend_api_key.strip():
-        return "Email OTP delivery requires a Resend API key"
+    api_key = settings.brevo_api_key if settings.email_provider == "brevo" else settings.resend_api_key
+    if not api_key.strip():
+        provider_name = "Brevo" if settings.email_provider == "brevo" else "Resend"
+        return f"Email OTP delivery requires a {provider_name} API key"
     sender_address = parseaddr(settings.email_from)[1]
     if not sender_address or "@" not in sender_address:
         return "Email OTP delivery requires a valid sender address"
@@ -134,28 +139,54 @@ def deliver_otp(channel: str, contact: str, code: str) -> str | None:
     configuration_error = email_delivery_configuration_error()
     if configuration_error:
         raise HTTPException(503, configuration_error)
-    response = httpx.post(
-        RESEND_EMAILS_URL,
-        headers={
+    subject = "Your ONPay sign-in code"
+    text_content = f"Your ONPay verification code is {code}. It expires in {settings.otp_ttl_minutes} minutes."
+    if settings.email_provider == "brevo":
+        sender_name, sender_address = parseaddr(settings.email_from)
+        sender = {"email": sender_address}
+        if sender_name:
+            sender["name"] = sender_name
+        endpoint = BREVO_EMAILS_URL
+        headers = {
+            "api-key": settings.brevo_api_key.strip(),
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        body = {
+            "sender": sender,
+            "to": [{"email": contact}],
+            "subject": subject,
+            "textContent": text_content,
+        }
+    else:
+        endpoint = RESEND_EMAILS_URL
+        headers = {
             "Authorization": f"Bearer {settings.resend_api_key.strip()}",
             "Content-Type": "application/json",
-        },
-        json={
+        }
+        body = {
             "from": settings.email_from,
             "to": [contact],
-            "subject": "Your ONPay sign-in code",
-            "text": f"Your ONPay verification code is {code}. It expires in {settings.otp_ttl_minutes} minutes.",
-        },
-        timeout=RESEND_REQUEST_TIMEOUT_SECONDS,
+            "subject": subject,
+            "text": text_content,
+        }
+    response = httpx.post(
+        endpoint,
+        headers=headers,
+        json=body,
+        timeout=EMAIL_REQUEST_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     try:
         result = response.json()
     except ValueError as exc:
-        raise RuntimeError("Resend returned an invalid acceptance response") from exc
-    email_id = result.get("id") if isinstance(result, dict) else None
+        provider_name = "Brevo" if settings.email_provider == "brevo" else "Resend"
+        raise RuntimeError(f"{provider_name} returned an invalid acceptance response") from exc
+    response_id_field = "messageId" if settings.email_provider == "brevo" else "id"
+    email_id = result.get(response_id_field) if isinstance(result, dict) else None
     if not isinstance(email_id, str) or not email_id.strip():
-        raise RuntimeError("Resend returned an invalid acceptance response")
+        provider_name = "Brevo" if settings.email_provider == "brevo" else "Resend"
+        raise RuntimeError(f"{provider_name} returned an invalid acceptance response")
     return email_id
 
 
@@ -182,7 +213,7 @@ def _log_otp_delivery_failure(
     logger.warning(
         "OTP delivery failed challenge_id=%s channel=%s provider=%s failure=%s "
         "error_type=%s cause_type=%s provider_status=%s",
-        challenge_id, channel, "twilio" if channel == "mobile" else "resend", failure,
+        challenge_id, channel, "twilio" if channel == "mobile" else settings.email_provider, failure,
         type(exc).__name__, type(cause).__name__, provider_status,
     )
 
