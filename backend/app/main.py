@@ -6,6 +6,7 @@ import logging
 import math
 import re
 import secrets
+import sys
 import threading
 import time
 import urllib.error
@@ -37,7 +38,25 @@ from .schemas import (
 from .security import COOKIE_NAME, create_session, current_user, hash_otp, hash_value, new_id
 
 app = FastAPI(title="ONPay API", version="0.1.0", description="Student cash exchange coordination API")
-logger = logging.getLogger("onpay.auth")
+
+
+def configure_app_logging() -> logging.Logger:
+    """Send ONPay application logs to stdout independently of Uvicorn's logger setup."""
+    app_logger = logging.getLogger("onpay.auth")
+    app_logger.setLevel(logging.INFO)
+    app_logger.propagate = False
+    if not any(getattr(handler, "_onpay_stdout_handler", False) for handler in app_logger.handlers):
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s %(message)s",
+        ))
+        handler._onpay_stdout_handler = True
+        app_logger.addHandler(handler)
+    return app_logger
+
+
+logger = configure_app_logging()
 RESEND_EMAILS_URL = "https://api.resend.com/emails"
 BREVO_EMAILS_URL = "https://api.brevo.com/v3/smtp/email"
 MAILJET_EMAILS_URL = "https://api.mailjet.com/v3.1/send"

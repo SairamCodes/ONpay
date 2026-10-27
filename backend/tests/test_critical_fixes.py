@@ -1,5 +1,8 @@
+import io
 import json
+import logging
 import os
+import sys
 import unittest
 from datetime import timedelta
 from unittest.mock import Mock, patch
@@ -20,7 +23,7 @@ from app.config import Settings, settings
 from app.database import Base, SessionLocal, engine
 from app.main import (
     app, check_quota, cors_options, create_listing, current_month_bounds, fastapi_app,
-    get_listings, haversine_km, health,
+    get_listings, haversine_km, health, logger,
     location_reverse, location_settings, logout, monthly_usage, request_otp, reverse_geocode, set_location, startup, subscriptions,
     verify_otp,
 )
@@ -56,6 +59,31 @@ class CriticalFixTests(unittest.TestCase):
 
     def tearDown(self):
         self.db.close()
+
+    def test_onpay_logger_emits_info_and_warning_to_stdout(self):
+        stdout_handlers = [
+            handler for handler in logger.handlers
+            if getattr(handler, "_onpay_stdout_handler", False)
+        ]
+        self.assertEqual(logger.level, logging.INFO)
+        self.assertFalse(logger.propagate)
+        self.assertEqual(len(stdout_handlers), 1)
+        handler = stdout_handlers[0]
+        self.assertIsInstance(handler, logging.StreamHandler)
+        self.assertEqual(handler.level, logging.INFO)
+        self.assertIs(handler.stream, sys.stdout)
+
+        captured = io.StringIO()
+        original_stream = handler.stream
+        handler.setStream(captured)
+        try:
+            logger.info("logging regression info marker")
+            logger.warning("logging regression warning marker")
+        finally:
+            handler.setStream(original_stream)
+        output = captured.getvalue()
+        self.assertIn("INFO onpay.auth logging regression info marker", output)
+        self.assertIn("WARNING onpay.auth logging regression warning marker", output)
 
     def _configure_resend(self):
         settings.email_provider = "resend"
