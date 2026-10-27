@@ -15,7 +15,7 @@ os.environ.setdefault("SECRET_KEY", "test-only-secret-key-with-more-than-32-char
 os.environ.setdefault("DATABASE_URL", "sqlite://")
 
 from app.database import Base
-from app.models import User, now_utc
+from app.models import Subscription, User, now_utc
 
 
 class MigrationRegressionTests(unittest.TestCase):
@@ -31,13 +31,17 @@ class MigrationRegressionTests(unittest.TestCase):
         try:
             database_url = f"sqlite:///{database_path.as_posix()}"
             engine = create_engine(database_url)
-            legacy_tables = [table for table in Base.metadata.sorted_tables if table.name != "otp_challenges"]
+            legacy_tables = [table for table in Base.metadata.sorted_tables if table.name not in ("otp_challenges", "payment_attempts")]
             Base.metadata.create_all(bind=engine, tables=legacy_tables)
 
             with Session(engine) as session:
                 session.add(User(
                     id="migration-user", full_name="Migration Test", email="migration@example.invalid",
-                    phone=None, college=None, verified_email=False, verified_phone=False, plan="free",
+                    phone=None, college=None, verified_email=False, verified_phone=False, plan="premium",
+                ))
+                session.add(Subscription(
+                    id="migration-subscription", user_id="migration-user", plan="premium", status="active",
+                    starts_at=now_utc(), expires_at=None,
                 ))
                 session.commit()
 
@@ -60,6 +64,29 @@ class MigrationRegressionTests(unittest.TestCase):
                         consumed_at DATETIME
                     )
                 """))
+                connection.execute(text("""
+                    CREATE TABLE payment_attempts (
+                        id VARCHAR(36) NOT NULL PRIMARY KEY,
+                        exchange_id VARCHAR(36) NOT NULL,
+                        payer_id VARCHAR(36) NOT NULL,
+                        payee_upi VARCHAR(100) NOT NULL,
+                        amount INTEGER NOT NULL,
+                        reference VARCHAR(40) NOT NULL UNIQUE,
+                        status VARCHAR(24) NOT NULL,
+                        provider VARCHAR(24) NOT NULL,
+                        provider_event_id VARCHAR(100) UNIQUE,
+                        provider_utr VARCHAR(32),
+                        created_at DATETIME NOT NULL,
+                        updated_at DATETIME NOT NULL
+                    )
+                """))
+                connection.execute(text("""
+                    INSERT INTO payment_attempts
+                        (id, exchange_id, payer_id, payee_upi, amount, reference, status, provider,
+                         provider_event_id, provider_utr, created_at, updated_at)
+                    VALUES ('migration-payment', 'legacy-exchange', 'migration-user', 'student@bank', 50000,
+                            'ONMIGRATION', 'verification_pending', 'upi_deep_link', NULL, NULL, :now, :now)
+                """), {"now": now_utc().isoformat()})
                 connection.execute(text("""
                     INSERT INTO otp_challenges
                         (id, contact, channel, intent, full_name, college, code_hash, provider_ref,
@@ -93,8 +120,16 @@ class MigrationRegressionTests(unittest.TestCase):
                 self.assertEqual(delivery_status[2].upper(), "VARCHAR(16)")
                 self.assertEqual(delivery_status[3], 1)  # NOT NULL
                 self.assertEqual(delivery_status[4], "'pending'")
+                payment_columns = {row[1]: row for row in connection.execute('PRAGMA table_info("payment_attempts")')}
+                self.assertIn("receiver_confirmed_by", payment_columns)
+                self.assertIn("receiver_confirmed_at", payment_columns)
+                self.assertEqual(payment_columns["receiver_confirmed_by"][3], 0)
+                self.assertEqual(payment_columns["receiver_confirmed_at"][3], 0)
                 self.assertEqual(connection.execute("SELECT count(*) FROM users").fetchone()[0], 1)
                 self.assertEqual(connection.execute("SELECT count(*) FROM otp_challenges").fetchone()[0], 1)
+                self.assertEqual(connection.execute("SELECT count(*) FROM payment_attempts").fetchone()[0], 1)
+                self.assertEqual(connection.execute("SELECT plan FROM users WHERE id = 'migration-user'").fetchone()[0], "pro")
+                self.assertEqual(connection.execute("SELECT plan FROM subscriptions WHERE id = 'migration-subscription'").fetchone()[0], "pro")
                 self.assertEqual(
                     connection.execute(
                         "SELECT delivery_status FROM otp_challenges WHERE id = ?", ("migration-challenge",),
@@ -103,7 +138,7 @@ class MigrationRegressionTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     connection.execute("SELECT version_num FROM alembic_version").fetchone()[0],
-                    "0002_location_otp_plans",
+                    "0003_receiver_confirmation_pro",
                 )
             finally:
                 connection.close()

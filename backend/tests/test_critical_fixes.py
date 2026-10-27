@@ -48,6 +48,8 @@ class CriticalFixTests(unittest.TestCase):
         settings.twilio_verify_service_sid = ""
         settings.session_cookie_samesite = "lax"
         settings.reverse_geocoder_user_agent = ""
+        settings.pro_plan_price_inr = None
+        settings.pro_plan_billing_period = ""
         Base.metadata.drop_all(bind=engine)
         Base.metadata.create_all(bind=engine)
         self.db = SessionLocal()
@@ -798,8 +800,9 @@ class CriticalFixTests(unittest.TestCase):
 
     def test_calendar_month_usage_counts_only_completed_and_reserves_active_slots(self):
         now = now_utc()
-        for suffix in range(4):
+        for suffix in range(3):
             self._exchange(suffix, "success", now)
+        self._exchange(3, "receiver_confirmed", now)
         self._exchange(4, "awaiting_meetup")
         self._exchange(5, "failed")
         self._exchange(6, "cancelled")
@@ -812,22 +815,81 @@ class CriticalFixTests(unittest.TestCase):
         with self.assertRaises(HTTPException):
             check_quota(self.db, self.requester)
 
-    def test_plan_prices_plus_quota_premium_unlimited_and_expiration(self):
+    def test_plan_prices_plus_quota_pro_unlimited_and_expiration(self):
         data = subscriptions(self.requester, self.db)
         plans = {plan["id"]: plan for plan in data["plans"]}
         self.assertEqual((plans["plus"]["price_inr"], plans["plus"]["limit"]), (199, 20))
-        self.assertEqual((plans["premium"]["name"], plans["premium"]["price_inr"], plans["premium"]["limit"]), ("Premium", 499, None))
-        premium = Subscription(id="premium-sub", user_id=self.requester.id, plan="premium", status="active",
+        self.assertEqual((plans["pro"]["name"], plans["pro"]["price_inr"], plans["pro"]["period"], plans["pro"]["limit"]), ("Pro", None, None, None))
+        pro = Subscription(id="pro-sub", user_id=self.requester.id, plan="pro", status="active",
                                starts_at=now_utc(), expires_at=None)
-        self.requester.plan = "premium"
-        self.db.add(premium)
+        self.requester.plan = "pro"
+        self.db.add(pro)
         self.db.commit()
         self.assertIsNone(subscriptions(self.requester, self.db)["remaining"])
-        premium.expires_at = now_utc() - timedelta(days=1)
+        self.assertEqual(subscriptions(self.requester, self.db)["current_plan"], "pro")
+        pro.expires_at = now_utc() - timedelta(days=1)
         self.db.commit()
         expired = subscriptions(self.requester, self.db)
         self.assertEqual(expired["current_plan"], "free")
-        self.assertEqual(self.db.get(Subscription, premium.id).status, "expired")
+        self.assertEqual(self.db.get(Subscription, pro.id).status, "expired")
+
+    def test_free_plan_caps_five_completed_monthly_transactions(self):
+        now = now_utc()
+        for suffix in range(5):
+            self._exchange(suffix, "success", now)
+        self.db.commit()
+        self.assertEqual(monthly_usage(self.db, self.requester.id), (5, 0))
+        with self.assertRaises(HTTPException):
+            check_quota(self.db, self.requester)
+
+    def test_plus_plan_caps_twenty_completed_transactions(self):
+        active = Subscription(id="plus-active", user_id=self.requester.id, plan="plus", status="active",
+                              starts_at=now_utc(), expires_at=None)
+        self.requester.plan = "plus"
+        self.db.add(active)
+        now = now_utc()
+        for suffix in range(20):
+            self._exchange(suffix, "success", now)
+        self.db.commit()
+        self.assertEqual(monthly_usage(self.db, self.requester.id), (20, 0))
+        with self.assertRaises(HTTPException):
+            check_quota(self.db, self.requester)
+
+    def test_month_usage_includes_receiver_confirmed_and_excludes_other_months_and_failures(self):
+        start, end = current_month_bounds()
+        before_month = start - timedelta(microseconds=1)
+        self._exchange(1, "success", before_month)
+        self._exchange(2, "receiver_confirmed", start)
+        self._exchange(3, "success", end)
+        self._exchange(4, "failed", start + timedelta(hours=1))
+        self._exchange(5, "cancelled", start + timedelta(hours=2))
+        self.db.commit()
+        self.assertEqual(monthly_usage(self.db, self.requester.id), (1, 0))
+
+    def test_pro_price_and_billing_interval_are_configurable_but_not_assumed(self):
+        settings.pro_plan_price_inr = 899
+        settings.pro_plan_billing_period = "year"
+        plans = {plan["id"]: plan for plan in subscriptions(self.requester, self.db)["plans"]}
+        self.assertEqual(plans["pro"]["price_inr"], 899)
+        self.assertEqual(plans["pro"]["period"], "year")
+
+    def test_cancelled_and_renewed_subscriptions_use_current_server_side_entitlement(self):
+        expired = Subscription(id="plus-old", user_id=self.requester.id, plan="plus", status="active",
+                               starts_at=now_utc() - timedelta(days=60), expires_at=now_utc() - timedelta(days=1))
+        renewed = Subscription(id="plus-renewed", user_id=self.requester.id, plan="plus", status="active",
+                               starts_at=now_utc(), expires_at=now_utc() + timedelta(days=30))
+        self.requester.plan = "free"
+        self.db.add_all((expired, renewed))
+        self.db.commit()
+        current = subscriptions(self.requester, self.db)
+        self.assertEqual(current["current_plan"], "plus")
+        self.assertEqual(self.db.get(Subscription, expired.id).status, "expired")
+
+        renewed.status = "cancelled"
+        self.db.commit()
+        cancelled = subscriptions(self.requester, self.db)
+        self.assertEqual(cancelled["current_plan"], "free")
+        self.assertEqual(self.db.get(Subscription, renewed.id).status, "cancelled")
 
     def test_calendar_month_uses_india_midnight_boundaries(self):
         start, end = current_month_bounds(now_utc().replace(year=2026, month=10, day=31, hour=20, minute=0))

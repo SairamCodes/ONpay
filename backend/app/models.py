@@ -125,6 +125,8 @@ class PaymentAttempt(Base):
     provider: Mapped[str] = mapped_column(String(24), default="upi_deep_link")
     provider_event_id: Mapped[str | None] = mapped_column(String(100), nullable=True, unique=True)
     provider_utr: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    receiver_confirmed_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    receiver_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
 

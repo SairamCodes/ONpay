@@ -2,9 +2,9 @@
 
 ## Current ONPay behavior
 
-The current payment adapter constructs a standard `upi://pay` intent with the agreed amount, scanned payee VPA, exchange reference, and INR currency. The student reviews those details and chooses to open the phone's supported UPI app chooser. ONPay does not collect a UPI PIN. Returning to the site moves the record to **Verification pending**; it does not count as settlement proof.
+The current payment adapter constructs a standard `upi://pay` intent with the agreed amount, scanned payee VPA, exchange reference, and INR currency. The student reviews those details and chooses to open the phone's supported UPI app chooser. ONPay does not collect a UPI PIN. Returning to the site moves the record to **Verification pending**; it does not count as settlement proof. When no provider confirmation is available, the cash provider can record **Recipient confirmed** after checking their own UPI app or bank account. That status records the authenticated recipient's assertion and timestamp; it is not independent bank/provider verification.
 
-The cash handover is stored separately from the digital payment. The server only marks an exchange successful after both participants confirm the cash handover and an operator has checked an independent bank record through the separately authenticated reconciliation endpoint. That endpoint is disabled until `RECONCILIATION_TOKEN` is configured. It awards points and creates a friend relationship idempotently after success.
+The cash handover is stored separately from the digital payment. A receiver-confirmed exchange completes only after both participants confirm the cash handover; it does not award points or create a friend relationship. The server marks an exchange **Bank/provider verified** only after both handovers and an operator has checked an independent bank record through the separately authenticated reconciliation endpoint. That endpoint is disabled until `RECONCILIATION_TOKEN` is configured. It awards points and creates a friend relationship idempotently after independent verification.
 
 ## YouPI-PG compatibility
 

@@ -46,11 +46,11 @@ For deployed builds, set the frontend hosting variable `VITE_API_BASE_URL` to th
 
 On the authenticated home screen, ONPay checks the browser's geolocation permission state. It retrieves coordinates automatically only when permission is already granted; otherwise the user can explicitly enable it or choose a campus manually. Nearby discovery uses the current coordinates and listings created with a rounded approximate position. Exact coordinates are not included in listing responses. Camera scanning uses the ZXing browser QR reader and requires HTTPS (or localhost) plus camera permission; image and manual UPI ID entry remain available as fallbacks.
 
-Plans are Free (₹0 / 5 completed exchanges per India calendar month), Plus (₹199 / 20), and Premium (₹499 / unlimited). The backend reserves available slots for in-progress exchanges and releases them for failed or cancelled exchanges. Paid billing is not configured, so the app shows it as unavailable and never activates a paid plan from an upgrade click.
+Plans are Free (₹0 / 5 completed exchanges per India calendar month), Plus (₹199 / 20), and Pro (unlimited). Pro pricing and billing interval are optional backend settings (`PRO_PLAN_PRICE_INR` and `PRO_PLAN_BILLING_PERIOD`) and remain unconfigured until approved. The backend reserves available slots for in-progress exchanges and releases them for failed or cancelled exchanges. Paid billing is not configured, so the app shows it as unavailable and never activates a paid plan from an upgrade click.
 
 ## Safety and payment status
 
-ONPay builds a standard `upi://pay` intent and asks the user to confirm before opening a payment app. Returning from that app, a screenshot, or a client-side button does not prove settlement. In this build, UPI attempts remain **Verification pending** until an authoritative provider integration is configured. Cash handover confirmations are recorded separately. No success state, reward, monthly quota usage, or friendship is granted from a payment-app redirect.
+ONPay builds a standard `upi://pay` intent and asks the user to confirm before opening a payment app. Returning from that app, a screenshot, or a client-side button does not prove settlement. When provider verification is unavailable, the exchange stays pending until its cash provider confirms receipt after checking their UPI app or bank account. That record is labeled **Recipient confirmed**, never bank-verified. Only the server-only reconciliation path with independent evidence receives the **Bank/provider verified** label and grants verification-only rewards. Both cash handovers must be recorded before either kind of confirmation completes the exchange.
 
 The available YouPI-PG project is a self-hosted experimental merchant collection gateway. Its documented payment endpoints create merchant orders and its checkout is tied to a receiving merchant account; it does not provide arbitrary student-to-student transfers. See the compatibility assessment in `docs/payment-integration.md` before any real-money work.
 
@@ -67,6 +67,6 @@ npm test
 npm run build
 ```
 
-The test suites mock email API, geocoding, and payment behavior; they do not send email, request device GPS, open a camera, or move real money.
+The test suites mock email API, geocoding, and payment behavior; they do not send email, request device GPS, open a camera, or move real money. Apply database migrations before deploying; `alembic upgrade head` adds the receiver audit fields and migrates Premium plan labels to Pro while preserving database rows.
 
 For real-money use, obtain a supported payment provider with server-side authoritative settlement callbacks, review applicable Indian payment and privacy requirements with qualified professionals, and complete security and reconciliation reviews.

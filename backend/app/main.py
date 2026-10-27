@@ -20,7 +20,7 @@ from uuid import uuid4
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, func, or_, update
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
@@ -523,12 +523,19 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * radius * math.asin(min(1, math.sqrt(value)))
 
 
-PLAN_CATALOG = (
-    {"id": "free", "name": "Free", "price_inr": 0, "period": "month", "limit": 5},
-    {"id": "plus", "name": "Plus", "price_inr": 199, "period": "month", "limit": 20},
-    {"id": "premium", "name": "Premium", "price_inr": 499, "period": "month", "limit": None},
+def plan_catalog() -> tuple[dict, ...]:
+    return (
+        {"id": "free", "name": "Free", "price_inr": 0, "period": "month", "limit": 5},
+        {"id": "plus", "name": "Plus", "price_inr": 199, "period": "month", "limit": 20},
+        {"id": "pro", "name": "Pro", "price_inr": settings.pro_plan_price_inr,
+         "period": settings.pro_plan_billing_period.strip() or None, "limit": None},
+    )
+
+
+IN_PROGRESS_EXCHANGE_STATES = (
+    "match_found", "awaiting_meetup", "meetup_confirmed", "payment_initiated", "verification_pending", "disputed",
 )
-IN_PROGRESS_EXCHANGE_STATES = ("match_found", "awaiting_meetup", "meetup_confirmed", "payment_initiated", "verification_pending", "disputed")
+COMPLETED_EXCHANGE_STATES = ("success", "receiver_confirmed")
 
 
 def current_month_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
@@ -548,29 +555,32 @@ def current_month_bounds(now: datetime | None = None) -> tuple[datetime, datetim
 
 
 def effective_plan(db: Session, user: User) -> str:
-    plan = "premium" if user.plan == "pro" else user.plan
-    if plan not in ("free", "plus", "premium"):
-        plan = "free"
-    if plan in ("plus", "premium"):
-        subscription = db.query(Subscription).filter_by(
-            user_id=user.id, plan=plan, status="active"
-        ).order_by(Subscription.starts_at.desc()).first()
-        if not subscription or (subscription.expires_at and subscription.expires_at <= now_utc()):
-            if subscription:
-                subscription.status = "expired"
-            user.plan = "free"
-            db.commit()
-            return "free"
-    if user.plan == "pro":
-        user.plan = "premium"
-        db.commit()
+    now = now_utc()
+    subscriptions = db.query(Subscription).filter(
+        Subscription.user_id == user.id,
+        Subscription.plan.in_(("plus", "pro", "premium")),
+        Subscription.status == "active",
+    ).order_by(Subscription.starts_at.desc()).all()
+    valid = []
+    for subscription in subscriptions:
+        if subscription.expires_at and subscription.expires_at <= now:
+            subscription.status = "expired"
+        elif subscription.starts_at is None or subscription.starts_at <= now:
+            valid.append(subscription)
+    # The subscription record is the server-side source of paid entitlements.
+    plan = "free"
+    if valid:
+        latest = valid[0]
+        plan = "pro" if latest.plan in ("pro", "premium") else "plus"
+    if user.plan != plan:
+        user.plan = plan
     return plan
 
 
 def monthly_usage(db: Session, user_id: str) -> tuple[int, int]:
     start, end = current_month_bounds()
     completed = db.query(Exchange).filter(
-        Exchange.status == "success", Exchange.completed_at >= start, Exchange.completed_at < end,
+        Exchange.status.in_(COMPLETED_EXCHANGE_STATES), Exchange.completed_at >= start, Exchange.completed_at < end,
         or_(Exchange.requester_id == user_id, Exchange.provider_id == user_id),
     ).count()
     reserved = db.query(Exchange).filter(
@@ -583,13 +593,14 @@ def monthly_usage(db: Session, user_id: str) -> tuple[int, int]:
 def user_payload(user: User, db: Session) -> dict:
     points = db.query(func.coalesce(func.sum(PointLedger.amount), 0)).filter_by(user_id=user.id).scalar() or 0
     completed = db.query(Exchange).filter(
-        Exchange.status == "success", or_(Exchange.requester_id == user.id, Exchange.provider_id == user.id)
+        Exchange.status.in_(COMPLETED_EXCHANGE_STATES),
+        or_(Exchange.requester_id == user.id, Exchange.provider_id == user.id),
     ).count()
     friends = db.query(Friendship).filter(or_(Friendship.user_low == user.id, Friendship.user_high == user.id)).count()
     return {
         "id": user.id, "full_name": user.full_name, "email": user.email, "phone": user.phone,
         "college": user.college, "location_label": user.location_label, "verified_email": user.verified_email,
-        "verified_phone": user.verified_phone, "plan": user.plan, "points": int(points),
+        "verified_phone": user.verified_phone, "plan": effective_plan(db, user), "points": int(points),
         "completed_exchanges": completed, "friends_count": friends,
     }
 
@@ -609,12 +620,24 @@ def get_exchange_for_user(db: Session, exchange_id: str, user_id: str) -> Exchan
     return exchange
 
 
+def begin_quota_serialization(db: Session) -> None:
+    """Serialize quota reservations on SQLite, where SELECT FOR UPDATE is ignored."""
+    if db.get_bind().dialect.name == "sqlite":
+        # Acquire SQLite's writer reservation before reading usage. Other SQLite
+        # transactions wait here instead of both observing the same free slot.
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+
+
 def exchange_payload(db: Session, exchange: Exchange, user_id: str) -> dict:
     other_id = exchange.provider_id if user_id == exchange.requester_id else exchange.requester_id
     other = db.get(User, other_id)
+    latest_payment = db.query(PaymentAttempt).filter_by(exchange_id=exchange.id).order_by(
+        PaymentAttempt.created_at.desc()
+    ).first()
     return {
         "id": exchange.id, "amount": exchange.amount, "location": exchange.location,
         "meetup_at": exchange.meetup_at, "status": exchange.status,
+        "payment_status": latest_payment.status if latest_payment else None,
         "requester_id": exchange.requester_id, "provider_id": exchange.provider_id,
         "requester_arrived": exchange.requester_arrived, "provider_arrived": exchange.provider_arrived,
         "requester_cash_confirmed": exchange.requester_cash_confirmed,
@@ -626,7 +649,7 @@ def exchange_payload(db: Session, exchange: Exchange, user_id: str) -> dict:
 
 def check_quota(db: Session, user: User) -> None:
     plan = effective_plan(db, user)
-    limit = next(item["limit"] for item in PLAN_CATALOG if item["id"] == plan)
+    limit = next(item["limit"] for item in plan_catalog() if item["id"] == plan)
     if limit is None:
         return
     completed, reserved = monthly_usage(db, user.id)
@@ -918,6 +941,7 @@ def update_listing(listing_id: str, payload: ListingUpdate, user: User = Depends
 
 @app.post("/api/listings/{listing_id}/accept")
 def accept_listing(listing_id: str, payload: AcceptListing, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    begin_quota_serialization(db)
     target = db.query(Listing).filter_by(id=listing_id).with_for_update().first()
     if not target or target.status != "active" or target.owner_id == user.id:
         raise HTTPException(404, "This listing is no longer available")
@@ -971,13 +995,17 @@ def get_exchange(exchange_id: str, user: User = Depends(current_user), db: Sessi
             "events": [{"status": event.status, "details": event.details, "created_at": event.created_at.isoformat()} for event in events],
             "payments": [{"id": item.id, "amount": item.amount, "reference": item.reference,
                           "status": item.status, "payee_upi": item.payee_upi,
+                          "receiver_confirmed_by": item.receiver_confirmed_by,
+                          "receiver_confirmed_at": item.receiver_confirmed_at.isoformat() if item.receiver_confirmed_at else None,
+                          "can_confirm_receipt": user.id == exchange.provider_id and item.status in ("payment_initiated", "verification_pending")
+                              and exchange.status not in ("cancelled", "expired", "disputed", "success", "receiver_confirmed"),
                           "created_at": item.created_at.isoformat()} for item in payments]}
 
 
 @app.patch("/api/exchanges/{exchange_id}/arrival")
 def update_arrival(exchange_id: str, payload: ArrivalUpdate, user: User = Depends(current_user), db: Session = Depends(get_db)):
     exchange = get_exchange_for_user(db, exchange_id, user.id)
-    if exchange.status in ("cancelled", "expired", "success", "disputed"):
+    if exchange.status in ("cancelled", "expired", "success", "receiver_confirmed", "disputed"):
         raise HTTPException(409, "This exchange can no longer record arrivals")
     if user.id == exchange.requester_id:
         exchange.requester_arrived = payload.arrived
@@ -995,6 +1023,8 @@ def update_arrival(exchange_id: str, payload: ArrivalUpdate, user: User = Depend
 @app.patch("/api/exchanges/{exchange_id}/cash-confirmation")
 def confirm_cash(exchange_id: str, payload: CashConfirmation, user: User = Depends(current_user), db: Session = Depends(get_db)):
     exchange = get_exchange_for_user(db, exchange_id, user.id)
+    if exchange.status in ("success", "receiver_confirmed", "cancelled", "expired", "disputed"):
+        raise HTTPException(409, "This exchange can no longer record a cash handover")
     if exchange.status not in ("meetup_confirmed", "payment_initiated", "verification_pending"):
         raise HTTPException(409, "Confirm arrival before recording a handover")
     if user.id == exchange.requester_id:
@@ -1003,6 +1033,19 @@ def confirm_cash(exchange_id: str, payload: CashConfirmation, user: User = Depen
         exchange.provider_cash_confirmed = payload.handed_over
     create_status_event(db, exchange.id, "cash_handover_confirmed" if payload.handed_over else "cash_handover_retracted", user.id,
                         "Physical cash handover confirmation recorded separately from digital payment")
+    if exchange.requester_cash_confirmed and exchange.provider_cash_confirmed:
+        latest_payment = db.query(PaymentAttempt).filter_by(exchange_id=exchange.id).order_by(
+            PaymentAttempt.created_at.desc()
+        ).first()
+        if latest_payment and latest_payment.status == "receiver_confirmed":
+            exchange.status = "receiver_confirmed"
+            exchange.completed_at = now_utc()
+            create_status_event(
+                db, exchange.id, "receiver_confirmed", latest_payment.receiver_confirmed_by,
+                "Exchange completed after both cash handovers and recipient confirmation; not independently bank-verified",
+            )
+            for participant in (exchange.requester_id, exchange.provider_id):
+                notify(db, participant, "Exchange completed", "The recipient confirmed the UPI receipt and both cash handovers were recorded. This is not independent bank verification.", "exchange")
     db.commit()
     return {"exchange": exchange_payload(db, exchange, user.id), "message": "Cash handover recorded; payment status is tracked separately."}
 
@@ -1045,9 +1088,11 @@ def create_payment(payload: PaymentCreate, user: User = Depends(current_user), d
         raise HTTPException(409, "Confirm meetup arrival before initiating payment")
     pending = db.query(PaymentAttempt).filter(
         PaymentAttempt.exchange_id == exchange.id,
-        PaymentAttempt.status.in_(("payment_initiated", "verification_pending")),
+        PaymentAttempt.status.in_(("payment_initiated", "verification_pending", "receiver_confirmed")),
     ).order_by(PaymentAttempt.created_at.desc()).first()
     if pending:
+        if pending.status == "receiver_confirmed":
+            raise HTTPException(409, "The recipient has already confirmed receipt for this payment")
         if pending.payee_upi != payload.payee_upi.strip():
             raise HTTPException(409, "A payment attempt is already pending for this exchange")
         recipient = db.get(User, exchange.provider_id)
@@ -1106,7 +1151,76 @@ def get_payment(payment_id: str, user: User = Depends(current_user), db: Session
         raise HTTPException(404, "Payment attempt not found")
     return {"payment": {"id": attempt.id, "reference": attempt.reference, "amount": attempt.amount,
                         "status": attempt.status, "last_updated": attempt.updated_at.isoformat(),
-                        "provider_utr": attempt.provider_utr}}
+                        "provider_utr": attempt.provider_utr,
+                        "receiver_confirmed_at": attempt.receiver_confirmed_at.isoformat() if attempt.receiver_confirmed_at else None,
+                        "receiver_confirmed_by": attempt.receiver_confirmed_by}}
+
+
+@app.post("/api/payments/{payment_id}/confirm-received")
+def confirm_payment_received(payment_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    attempt = db.query(PaymentAttempt).filter_by(id=payment_id).with_for_update().first()
+    if not attempt:
+        raise HTTPException(404, "Payment attempt not found")
+    exchange = db.query(Exchange).filter_by(id=attempt.exchange_id).with_for_update().first()
+    if not exchange or user.id != exchange.provider_id or attempt.payer_id != exchange.requester_id:
+        raise HTTPException(403, "Only the exchange recipient can confirm receipt")
+    if attempt.amount <= 0 or attempt.amount != exchange.amount:
+        raise HTTPException(409, "Payment amount does not match the agreed exchange amount")
+    if attempt.status in ("receiver_confirmed", "success") and attempt.receiver_confirmed_by == user.id:
+        return {"payment": {"id": attempt.id, "amount": attempt.amount, "status": attempt.status,
+                            "receiver_confirmed_by": attempt.receiver_confirmed_by,
+                            "receiver_confirmed_at": attempt.receiver_confirmed_at.isoformat() if attempt.receiver_confirmed_at else None},
+                "exchange": exchange_payload(db, exchange, user.id), "duplicate": True}
+    if exchange.status in ("cancelled", "expired", "disputed", "success", "receiver_confirmed"):
+        raise HTTPException(409, "This exchange is not awaiting recipient confirmation")
+    if attempt.status not in ("payment_initiated", "verification_pending"):
+        raise HTTPException(409, "This payment is not awaiting recipient confirmation")
+
+    confirmed_at = now_utc()
+    result = db.execute(
+        update(PaymentAttempt)
+        .where(
+            PaymentAttempt.id == attempt.id,
+            PaymentAttempt.status.in_(("payment_initiated", "verification_pending")),
+            PaymentAttempt.amount == exchange.amount,
+        )
+        .values(status="receiver_confirmed", receiver_confirmed_by=user.id,
+                receiver_confirmed_at=confirmed_at, updated_at=confirmed_at)
+    )
+    if result.rowcount != 1:
+        db.rollback()
+        latest = db.get(PaymentAttempt, payment_id)
+        if latest and latest.status in ("receiver_confirmed", "success") and latest.receiver_confirmed_by == user.id:
+            latest_exchange = db.get(Exchange, latest.exchange_id)
+            return {"payment": {"id": latest.id, "amount": latest.amount, "status": latest.status,
+                                "receiver_confirmed_by": latest.receiver_confirmed_by,
+                                "receiver_confirmed_at": latest.receiver_confirmed_at.isoformat() if latest.receiver_confirmed_at else None},
+                    "exchange": exchange_payload(db, latest_exchange, user.id), "duplicate": True}
+        raise HTTPException(409, "This payment was already updated and can no longer be confirmed")
+
+    db.expire(attempt)
+    attempt = db.get(PaymentAttempt, payment_id)
+    exchange.status = "verification_pending"
+    create_status_event(
+        db, exchange.id, "receipt_confirmed", user.id,
+        "Recipient confirmed receipt after checking their UPI app or bank account; not independently bank-verified",
+    )
+    if exchange.requester_cash_confirmed and exchange.provider_cash_confirmed:
+        exchange.status = "receiver_confirmed"
+        exchange.completed_at = confirmed_at
+        create_status_event(
+            db, exchange.id, "receiver_confirmed", user.id,
+            "Exchange completed after both cash handovers and recipient confirmation; not independently bank-verified",
+        )
+        for participant in (exchange.requester_id, exchange.provider_id):
+            notify(db, participant, "Exchange completed", "The recipient confirmed the UPI receipt and both cash handovers were recorded. This is not independent bank verification.", "exchange")
+    else:
+        notify(db, exchange.requester_id, "Recipient confirmed receipt", "The recipient confirmed the UPI receipt. The exchange remains open until both cash handovers are recorded.", "payment")
+    db.commit()
+    return {"payment": {"id": attempt.id, "amount": attempt.amount, "status": attempt.status,
+                        "receiver_confirmed_by": attempt.receiver_confirmed_by,
+                        "receiver_confirmed_at": attempt.receiver_confirmed_at.isoformat() if attempt.receiver_confirmed_at else None},
+            "exchange": exchange_payload(db, exchange, user.id), "duplicate": False}
 
 
 @app.get("/api/transactions")
@@ -1124,6 +1238,8 @@ def transactions(
     status_map = {"in_transit": ("match_found", "awaiting_meetup", "meetup_confirmed", "payment_initiated", "verification_pending")}
     if status_filter == "in_transit":
         query = query.filter(Exchange.status.in_(status_map[status_filter]))
+    elif status_filter == "success":
+        query = query.filter(Exchange.status.in_(COMPLETED_EXCHANGE_STATES))
     elif status_filter != "all":
         query = query.filter(Exchange.status == status_filter)
     rows = query.order_by(Exchange.created_at.desc()).offset(offset).limit(limit + 1).all()
@@ -1231,18 +1347,19 @@ def mark_notification_read(notification_id: str, user: User = Depends(current_us
 @app.get("/api/subscriptions")
 def subscriptions(user: User = Depends(current_user), db: Session = Depends(get_db)):
     plan = effective_plan(db, user)
+    db.commit()  # Persist expiry/cancellation normalization when loading the plan page.
     used, reserved = monthly_usage(db, user.id)
-    limit = next(item["limit"] for item in PLAN_CATALOG if item["id"] == plan)
+    limit = next(item["limit"] for item in plan_catalog() if item["id"] == plan)
     return {"current_plan": plan, "usage": used, "reserved": reserved, "limit": limit,
             "remaining": None if limit is None else max(0, limit - used - reserved),
-            "plans": list(PLAN_CATALOG), "billing_configured": False,
+            "plans": list(plan_catalog()), "billing_configured": False,
             "billing_status": "unavailable"}
 
 
 @app.post("/api/subscriptions/{plan}/checkout")
 def subscription_checkout(plan: str, user: User = Depends(current_user)):
-    if plan not in ("plus", "premium"):
-        raise HTTPException(400, "Choose Plus or Premium")
+    if plan not in ("plus", "pro"):
+        raise HTTPException(400, "Choose Plus or Pro")
     raise HTTPException(503, "Subscription billing is not configured. No plan has been activated.")
 
 
@@ -1310,7 +1427,7 @@ def reconcile_payment(
         raise HTTPException(409, "Both participants must confirm the cash handover first")
     if attempt.status == "success" and exchange.status == "success":
         return {"status": "success", "duplicate": True}
-    if attempt.status not in ("payment_initiated", "verification_pending"):
+    if attempt.status not in ("payment_initiated", "verification_pending", "receiver_confirmed"):
         raise HTTPException(409, "Payment attempt cannot be reconciled from its current state")
     attempt.status = "success"
     attempt.updated_at = now_utc()
@@ -1376,11 +1493,23 @@ async def youpi_webhook(request: Request, db: Session = Depends(get_db)):
     duplicate = db.query(PaymentAttempt).filter_by(provider_event_id=delivery_id).first()
     if duplicate and duplicate.id != attempt.id:
         return {"received": True, "duplicate": True, "status": duplicate.status}
+    exchange = db.get(Exchange, attempt.exchange_id)
+    if attempt.status in ("receiver_confirmed", "success"):
+        attempt.provider_event_id = delivery_id
+        attempt.provider = "youpi_merchant_experimental"
+        attempt.updated_at = now_utc()
+        create_status_event(
+            db, exchange.id, "provider_event_received", None,
+            "Signed experimental provider event recorded; existing recipient confirmation or independent verification was preserved",
+        )
+        db.commit()
+        return {"received": True, "status": attempt.status, "reconciliation_required": attempt.status != "success"}
+    if attempt.status not in ("payment_initiated", "verification_pending"):
+        raise HTTPException(409, "Payment attempt cannot accept a provider event in its current state")
     attempt.provider_event_id = delivery_id
     attempt.provider = "youpi_merchant_experimental"
     attempt.status = "verification_pending"
     attempt.updated_at = now_utc()
-    exchange = db.get(Exchange, attempt.exchange_id)
     exchange.status = "verification_pending"
     create_status_event(db, exchange.id, "verification_pending", None,
         "Signed experimental merchant event received; independent settlement reconciliation is still required")

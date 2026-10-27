@@ -1,3 +1,6 @@
+import hashlib
+import hmac
+import json
 import os
 import unittest
 from fastapi import HTTPException, Response
@@ -10,10 +13,11 @@ os.environ["DATABASE_URL"] = "sqlite://"
 from app.config import settings
 from app.database import Base, SessionLocal, engine
 from app.main import (
-    accept_listing, confirm_cash, create_listing, create_payment, get_exchange_for_user,
+    accept_listing, confirm_cash, confirm_payment_received, create_listing, create_payment, get_exchange, get_exchange_for_user,
     payment_returned, reconcile_payment, request_otp, update_arrival, verify_otp,
 )
-from app.models import Exchange, Friendship, Listing, PointLedger, User
+from app.main import subscription_checkout, youpi_webhook
+from app.models import Exchange, Friendship, Listing, PaymentAttempt, PointLedger, StatusEvent, Subscription, User
 from app.security import COOKIE_NAME, current_user
 from app.schemas import (
     AcceptListing, ArrivalUpdate, CashConfirmation, ListingCreate, OTPRequest,
@@ -26,6 +30,7 @@ class DomainFlowTests(unittest.TestCase):
         settings.app_env = "development"
         settings.dev_otp_mode = True
         settings.reconciliation_token = ""
+        settings.youpi_webhook_secret = ""
         Base.metadata.drop_all(bind=engine)
         Base.metadata.create_all(bind=engine)
         self.db = SessionLocal()
@@ -135,6 +140,131 @@ class DomainFlowTests(unittest.TestCase):
         )
         self.assertTrue(duplicate_reconciliation["duplicate"])
         self.assertEqual(self.db.query(PointLedger).count(), 2)
+
+    def _pending_payment(self, both_cash_confirmed=True):
+        request = create_listing(ListingCreate(
+            kind="need", amount_min=50000, amount_max=50000, location="University library",
+            availability="Today after 2 PM", note="Need cash",
+        ), self.requester, self.db)["listing"]
+        create_listing(ListingCreate(
+            kind="have", amount_min=30000, amount_max=70000, location="University library",
+            availability="Today after 2 PM", note="Can meet",
+        ), self.provider, self.db)
+        exchange_id = accept_listing(request["id"], AcceptListing(amount=50000), self.provider, self.db)["exchange"]["id"]
+        update_arrival(exchange_id, ArrivalUpdate(arrived=True), self.requester, self.db)
+        update_arrival(exchange_id, ArrivalUpdate(arrived=True), self.provider, self.db)
+        confirm_cash(exchange_id, CashConfirmation(handed_over=True), self.requester, self.db)
+        if both_cash_confirmed:
+            confirm_cash(exchange_id, CashConfirmation(handed_over=True), self.provider, self.db)
+        payment = create_payment(PaymentCreate(exchange_id=exchange_id, payee_upi="aman.student@okaxis"), self.requester, self.db)["payment"]
+        payment_returned(payment["id"], self.requester, self.db)
+        return exchange_id, payment["id"]
+
+    def test_recipient_can_confirm_receipt_and_audit_is_recorded(self):
+        exchange_id, payment_id = self._pending_payment()
+        provider_payment = get_exchange(exchange_id, self.provider, self.db)["payments"][0]
+        payer_payment = get_exchange(exchange_id, self.requester, self.db)["payments"][0]
+        self.assertTrue(provider_payment["can_confirm_receipt"])
+        self.assertFalse(payer_payment["can_confirm_receipt"])
+        result = confirm_payment_received(payment_id, self.provider, self.db)
+        payment = self.db.get(PaymentAttempt, payment_id)
+        exchange = self.db.get(Exchange, exchange_id)
+        self.assertEqual(result["payment"]["status"], "receiver_confirmed")
+        self.assertEqual(payment.receiver_confirmed_by, self.provider.id)
+        self.assertIsNotNone(payment.receiver_confirmed_at)
+        self.assertEqual(exchange.status, "receiver_confirmed")
+        self.assertIsNotNone(exchange.completed_at)
+        receipt_event = self.db.query(StatusEvent).filter_by(exchange_id=exchange_id, status="receipt_confirmed").one()
+        self.assertEqual(receipt_event.actor_id, self.provider.id)
+        self.assertIn("not independently bank-verified", receipt_event.details)
+        self.assertEqual(self.db.query(PointLedger).count(), 0)
+        self.assertEqual(self.db.query(Friendship).count(), 0)
+
+    def test_payer_cannot_confirm_receipt(self):
+        _exchange_id, payment_id = self._pending_payment()
+        with self.assertRaises(HTTPException) as denied:
+            confirm_payment_received(payment_id, self.requester, self.db)
+        self.assertEqual(denied.exception.status_code, 403)
+        self.assertEqual(self.db.get(PaymentAttempt, payment_id).status, "verification_pending")
+
+    def test_recipient_confirmation_is_idempotent(self):
+        exchange_id, payment_id = self._pending_payment()
+        first = confirm_payment_received(payment_id, self.provider, self.db)
+        confirmed_at = first["payment"]["receiver_confirmed_at"]
+        second = confirm_payment_received(payment_id, self.provider, self.db)
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(second["payment"]["receiver_confirmed_at"], confirmed_at)
+        self.assertEqual(self.db.query(StatusEvent).filter_by(exchange_id=exchange_id, status="receipt_confirmed").count(), 1)
+
+    def test_receiver_confirmation_rejects_wrong_state_and_wrong_amount(self):
+        _exchange_id, payment_id = self._pending_payment()
+        attempt = self.db.get(PaymentAttempt, payment_id)
+        attempt.status = "failed"
+        self.db.commit()
+        with self.assertRaises(HTTPException) as wrong_state:
+            confirm_payment_received(payment_id, self.provider, self.db)
+        self.assertEqual(wrong_state.exception.status_code, 409)
+
+        attempt.status = "verification_pending"
+        attempt.amount -= 1
+        self.db.commit()
+        with self.assertRaises(HTTPException) as wrong_amount:
+            confirm_payment_received(payment_id, self.provider, self.db)
+        self.assertEqual(wrong_amount.exception.status_code, 409)
+
+    def test_payment_remains_pending_until_receipt_and_cash_handover(self):
+        exchange_id, payment_id = self._pending_payment(both_cash_confirmed=False)
+        before = self.db.get(Exchange, exchange_id)
+        self.assertEqual(before.status, "verification_pending")
+        self.assertIsNone(before.completed_at)
+        confirm_payment_received(payment_id, self.provider, self.db)
+        still_open = self.db.get(Exchange, exchange_id)
+        self.assertEqual(still_open.status, "verification_pending")
+        self.assertIsNone(still_open.completed_at)
+        confirm_cash(exchange_id, CashConfirmation(handed_over=True), self.provider, self.db)
+        completed = self.db.get(Exchange, exchange_id)
+        self.assertEqual(completed.status, "receiver_confirmed")
+        self.assertIsNotNone(completed.completed_at)
+
+    def test_experimental_provider_event_does_not_erase_receiver_confirmation(self):
+        exchange_id, payment_id = self._pending_payment()
+        confirm_payment_received(payment_id, self.provider, self.db)
+        payment = self.db.get(PaymentAttempt, payment_id)
+        settings.youpi_webhook_secret = "test-webhook-secret"
+        body = json.dumps({"event": "SUCCESS", "orderId": payment.reference, "amountPaise": payment.amount}).encode()
+        signature = "sha256=" + hmac.new(settings.youpi_webhook_secret.encode(), body, hashlib.sha256).hexdigest()
+        async def receive_request():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request = Request({
+            "type": "http", "method": "POST", "scheme": "https", "path": "/api/webhooks/youpi",
+            "query_string": b"", "headers": [(b"x-gateway-signature", signature.encode()),
+                                                   (b"x-gateway-delivery-id", b"event-after-receipt")],
+        }, receive=receive_request)
+        operation = youpi_webhook(request, self.db)
+        try:
+            operation.send(None)
+        except StopIteration as completed:
+            result = completed.value
+        else:
+            self.fail("Webhook handler unexpectedly suspended during local request-body processing")
+        self.assertEqual(result["status"], "receiver_confirmed")
+        self.assertEqual(self.db.get(PaymentAttempt, payment_id).status, "receiver_confirmed")
+        self.assertEqual(self.db.get(Exchange, exchange_id).status, "receiver_confirmed")
+
+    def test_unauthenticated_user_cannot_start_subscription_checkout(self):
+        anonymous_request = Request({
+            "type": "http", "method": "POST", "scheme": "http", "path": "/api/subscriptions/pro/checkout",
+            "query_string": b"", "headers": [],
+        })
+        with self.assertRaises(HTTPException) as unauthorized:
+            current_user(anonymous_request, self.db)
+        self.assertEqual(unauthorized.exception.status_code, 401)
+        with self.assertRaises(HTTPException) as unavailable:
+            subscription_checkout("pro", self.requester)
+        self.assertEqual(unavailable.exception.status_code, 503)
+        self.assertEqual(self.requester.plan, "free")
+        self.assertEqual(self.db.query(Subscription).count(), 0)
 
 
 if __name__ == "__main__":

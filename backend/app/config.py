@@ -1,5 +1,6 @@
 from functools import lru_cache
 from typing import Literal
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +22,8 @@ class Settings(BaseSettings):
     resend_api_key: str = ""
     brevo_api_key: str = ""
     email_from: str = ""
+    pro_plan_price_inr: int | None = Field(default=None, ge=0)
+    pro_plan_billing_period: str = ""
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
     twilio_verify_service_sid: str = ""
