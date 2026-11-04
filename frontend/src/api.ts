@@ -33,7 +33,7 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
     response = await fetch(url.toString(), {
       ...options,
       credentials: 'include',
-      headers: { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers },
+      headers: { ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}), ...options.headers },
     })
   } catch (error) {
     console.error('[ONPay API] Network request failed before an HTTP response', {

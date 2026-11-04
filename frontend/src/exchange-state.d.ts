@@ -10,5 +10,7 @@ export type ExchangeSnapshot = {
 
 export function exchangeSnapshotChanged(current: ExchangeSnapshot | null, latest: ExchangeSnapshot | null): boolean
 
+export function isPaymentReadyExchange(exchange: Pick<ExchangeSnapshot, 'status' | 'requester_arrived' | 'provider_arrived'>): boolean
+
 export type PaymentStatusResult = { id: string; status: string; [key: string]: unknown }
 export function refreshPaymentStatus(api: (path: string, options?: RequestInit) => Promise<any>, paymentId: string, currentStatus: string): Promise<PaymentStatusResult>

@@ -3,17 +3,21 @@ import type { ReactNode } from 'react'
 import type { BrowserQRCodeReader as BrowserQRCodeReaderType, IScannerControls } from '@zxing/browser'
 import { api, ApiError, json, patch } from './api'
 import { getAuthState, restoreAuthSession } from './auth-session.js'
-import { exchangeSnapshotChanged, refreshPaymentStatus } from './exchange-state.js'
+import { exchangeSnapshotChanged, isPaymentReadyExchange, refreshPaymentStatus } from './exchange-state.js'
+import { fetchAvailableListings } from './listing-feed.js'
+import { matchAndNavigate } from './match-flow.js'
 import { detectCurrentLocation, saveManualLocation } from './location.js'
 import type { ResolvedLocation } from './location.js'
 import { parseUpiPayload } from './upi.js'
+import { SendMatchRequestModal } from './features/match-requests/SendMatchRequestModal'
+import { ONPayWebSocket } from './ws'
 
 type Screen = 'welcome' | 'signup' | 'login' | 'verify' | 'home' | 'matches' | 'need' | 'have' | 'chats' | 'scan' | 'transactions' | 'profile' | 'meetup' | 'student' | 'notifications' | 'subscriptions' | 'points' | 'location' | 'help' | 'payment'
-type User = { id: string; full_name: string; email?: string | null; phone?: string | null; college?: string | null; location_label?: string | null; verified_email: boolean; verified_phone: boolean; plan: string; points: number; completed_exchanges: number; friends_count: number }
+type User = { id: string; full_name: string; email?: string | null; phone?: string | null; college?: string | null; location_label?: string | null; verified_email: boolean; verified_phone: boolean; plan: string; points: number; completed_exchanges: number; friends_count: number; upi_id?: string | null }
 type OtpChannel = 'mobile' | 'email'
 type OtpRequestResult = { accepted: true; challenge_id: string; expires_in_seconds: number; resend_in_seconds: number; channel: OtpChannel; contact: string; intent: 'signup' | 'login'; full_name?: string; college?: string | null; development_code?: string }
-type Listing = { id: string; kind: 'need' | 'have'; amount_min: number; amount_max: number; location: string; availability: string; note: string; status: string; distance_km?: number | null; owner: { id: string; full_name: string; college?: string | null; verified: boolean }; mine?: boolean }
-type Exchange = { id: string; amount: number; location: string; meetup_at: string; status: string; payment_status?: string | null; requester_id: string; provider_id: string; created_at?: string; requester_arrived: boolean; provider_arrived: boolean; requester_cash_confirmed: boolean; provider_cash_confirmed: boolean; other_user: { id: string; full_name: string; college?: string | null } }
+type Listing = { id: string; kind: 'need' | 'have'; amount_min: number; amount_max: number; location: string; availability: string; note: string; search_radius_km?: number; status: string; distance_km?: number | null; owner: { id: string; full_name: string; college?: string | null; verified: boolean }; mine?: boolean }
+type Exchange = { id: string; amount: number; location: string; meetup_at: string; status: string; payment_status?: string | null; requester_id: string; provider_id: string; created_at?: string; completed_at?: string | null; requester_arrived: boolean; provider_arrived: boolean; requester_cash_confirmed: boolean; provider_cash_confirmed: boolean; seeker_cash_received?: boolean; seeker_cash_received_at?: string | null; provider_upi_received?: boolean; provider_upi_received_at?: string | null; other_user: { id: string; full_name: string; college?: string | null } }
 type Payment = { id: string; reference: string; amount: number; status: string; upi_uri: string; verification_note: string }
 type Coordinates = { latitude: number; longitude: number }
 type GeoStatus = 'checking' | 'prompt' | 'loading' | 'ready' | 'denied' | 'unavailable' | 'error' | 'insecure'
@@ -278,6 +282,15 @@ export default function App() {
     return () => { active = false; if (permissionStatus) permissionStatus.onchange = null }
   }, [user?.id, screen, refreshLocation])
 
+  useEffect(() => {
+    if (!user?.id) return
+    const ws = new ONPayWebSocket()
+    ws.connect()
+    ws.on('match_request_received', () => { setUnreadCount((count) => count + 1) })
+    ws.on('chat_message', () => { setUnreadCount((count) => count + 1) })
+    return () => { ws.disconnect() }
+  }, [user?.id])
+
   const navigate = useCallback((next: Screen) => { setScreen(next); setError(''); window.location.hash = next }, [])
   const signIn = async () => {
     const session = await restoreAuthSession<User>((path) => api(path))
@@ -317,7 +330,7 @@ export default function App() {
         {screen === 'student' && selectedListing && <StudentPage listing={selectedListing} navigate={navigate} setChatTarget={setChatTarget} setError={setError}/>}
         {screen === 'chats' && <ChatsPage targetUserId={chatTarget} user={user} setChatTarget={setChatTarget} setError={setError}/>}
         {screen === 'scan' && <ScannerPage user={user} exchangesAction={setSelectedExchange} navigate={navigate} payment={payment} setPayment={setPayment} setError={setError}/>}
-        {screen === 'transactions' && <TransactionsPage navigate={navigate} setSelectedExchange={setSelectedExchange}/>}
+        {screen === 'transactions' && <TransactionsPage coordinates={geoCoordinates} navigate={navigate} setSelectedListing={setSelectedListing} setSelectedExchange={setSelectedExchange}/>}
         {screen === 'meetup' && <MeetupPage user={user} selected={selectedExchange} setSelected={setSelectedExchange} navigate={navigate} setError={setError}/>}
         {screen === 'payment' && payment && <PaymentPage payment={payment} setPayment={setPayment} navigate={navigate}/>}
         {screen === 'notifications' && <NotificationsPage onRead={() => setUnreadCount((count) => Math.max(0, count - 1))}/>}
@@ -355,15 +368,23 @@ function HomePage({ user, locationLabel, geoLabel, geoStatus, geoMessage, coordi
   const [listings, setListings] = useState<Listing[]>([])
   const [mine, setMine] = useState<any[]>([])
   const [exchanges, setExchanges] = useState<Exchange[]>([])
+  const [matchRequests, setMatchRequests] = useState<{ incoming: any[]; outgoing: any[] }>({ incoming: [], outgoing: [] })
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
   const [retry, setRetry] = useState(0)
   const load = useCallback(async () => {
     try {
-      const query = new URLSearchParams()
-      if (coordinates) { query.set('latitude', String(coordinates.latitude)); query.set('longitude', String(coordinates.longitude)); query.set('radius_km', '25') }
-      const [nearby, own, activity] = await Promise.all([api(`/api/listings${query.size ? `?${query}` : ''}`), api('/api/my-listings'), api('/api/exchanges')])
-      setListings(nearby.listings.slice(0, 3)); setMine(own.listings.filter((item: any) => item.status !== 'cancelled')); setExchanges(activity.exchanges.slice(0, 2)); setLoadError('')
+      const [available, own, activity, mr] = await Promise.all([
+        fetchAvailableListings<Listing>(api, coordinates),
+        api('/api/my-listings'),
+        api('/api/exchanges'),
+        api('/api/match-requests').catch(() => ({ incoming: [], outgoing: [] })),
+      ])
+      setListings(available.slice(0, 3))
+      setMine(own.listings.filter((item: any) => item.status !== 'cancelled'))
+      setExchanges(activity.exchanges.slice(0, 2))
+      setMatchRequests(mr || { incoming: [], outgoing: [] })
+      setLoadError('')
     } catch (failure) { setLoadError(failure instanceof Error ? failure.message : 'Could not load your ONPay activity.') } finally { setLoading(false) }
   }, [coordinates, retry])
   useEffect(() => { load() }, [load])
@@ -376,6 +397,98 @@ function HomePage({ user, locationLabel, geoLabel, geoStatus, geoMessage, coordi
       <button className="action-card need-card" onClick={() => navigate('need')}><span className="action-icon"><Icon name="arrow"/></span><strong>I need cash</strong><small>Pay digitally and receive cash</small><b className="card-link">Find a match <Icon name="arrow" size={16}/></b></button>
       <button className="action-card have-card" onClick={() => navigate('have')}><span className="action-icon"><Icon name="check"/></span><strong>I have cash</strong><small>Give cash and receive UPI</small><b className="card-link">Publish an offer <Icon name="arrow" size={16}/></b></button>
     </section>
+
+    {(matchRequests.incoming.length > 0 || matchRequests.outgoing.length > 0) && (
+      <section className="section-block">
+        <div className="section-title">
+          <div><h2>Match requests</h2><p>Incoming requests from seekers and your sent requests</p></div>
+        </div>
+        {matchRequests.incoming.map((req: any) => (
+          <div key={req.id} className="match-request-card">
+            <div className="mr-header">
+              <div className="mr-user-info">
+                <Avatar name={req.seeker_name || 'Student'} size="sm" />
+                <div>
+                  <strong>{req.seeker_name}</strong>
+                  <small style={{ display: 'block', color: 'var(--muted)' }}>Wants to exchange cash</small>
+                </div>
+              </div>
+              <div className="mr-amount">{money(req.amount)}</div>
+            </div>
+            {req.note && <p style={{ fontSize: '13px', margin: '4px 0 8px', color: 'var(--muted)' }}>"{req.note}"</p>}
+            {req.status === 'pending' ? (
+              <div className="mr-actions">
+                <button
+                  className="accept-btn"
+                  onClick={async () => {
+                    try {
+                      const res = await api(`/api/match-requests/${req.id}/accept`, { method: 'PATCH' })
+                      if (res.exchange) {
+                        setSelectedExchange(res.exchange)
+                        navigate('meetup')
+                      }
+                    } catch (e: any) {
+                      alert(e?.message || 'Could not accept request')
+                    }
+                  }}
+                >
+                  Accept & Meet
+                </button>
+                <button
+                  className="reject-btn"
+                  onClick={async () => {
+                    try {
+                      await api(`/api/match-requests/${req.id}/reject`, { method: 'PATCH' })
+                      load()
+                    } catch (e: any) {
+                      alert(e?.message || 'Could not decline request')
+                    }
+                  }}
+                >
+                  Decline
+                </button>
+              </div>
+            ) : (
+              <span className={`mr-status ${req.status}`}>{req.status}</span>
+            )}
+          </div>
+        ))}
+        {matchRequests.outgoing.map((req: any) => (
+          <div key={req.id} className="match-request-card">
+            <div className="mr-header">
+              <div className="mr-user-info">
+                <Avatar name={req.provider_name || 'Student'} size="sm" />
+                <div>
+                  <strong>To: {req.provider_name}</strong>
+                  <small style={{ display: 'block', color: 'var(--muted)' }}>Sent request</small>
+                </div>
+              </div>
+              <div style={{ textAlign: 'right' }}>
+                <div className="mr-amount">{money(req.amount)}</div>
+                <span className={`mr-status ${req.status}`}>{req.status}</span>
+              </div>
+            </div>
+            {req.status === 'pending' && (
+              <div className="mr-actions">
+                <button
+                  className="cancel-btn"
+                  onClick={async () => {
+                    try {
+                      await api(`/api/match-requests/${req.id}/cancel`, { method: 'POST' })
+                      load()
+                    } catch (e: any) {
+                      alert(e?.message || 'Could not cancel request')
+                    }
+                  }}
+                >
+                  Cancel Request
+                </button>
+              </div>
+            )}
+          </div>
+        ))}
+      </section>
+    )}
     <section className="section-block">
       <div className="section-title"><div><h2>Nearby activity</h2><p>Students who have chosen to share a listing</p></div><button className="text-action" onClick={() => navigate('matches')}>View all <Icon name="arrow" size={15}/></button></div>
       {loading ? <div className="loading-inline"><span className="spinner"/>Loading listings…</div> : loadError ? <p className="inline-error" role="alert">{loadError} <button className="text-action" onClick={() => setRetry((value) => value + 1)}>Try again</button></p> : listings.length ? <div className="listing-stack">{listings.map((listing) => <ListingCard key={listing.id} listing={listing} onClick={() => { setSelectedListing(listing); navigate('student') }}/>)}</div> : <EmptyState title="No nearby listings yet" body="When students post a cash request or offer, it will show here. Your home feed does not use sample profiles." action={<button className="button button-soft" onClick={() => navigate('matches')}>Explore listings</button>}/>}</section>
@@ -401,13 +514,14 @@ function ListingForm({ kind, locationLabel, coordinates, navigate, setError }: {
   const [location, setLocation] = useState(locationLabel)
   const [availability, setAvailability] = useState('Today, 2:00 PM – 4:00 PM')
   const [note, setNote] = useState('')
+  const [searchRadius, setSearchRadius] = useState(10)
   const [saving, setSaving] = useState(false)
   const isNeed = kind === 'need'
   const submit = async (event: FormEvent) => {
     event.preventDefault(); setSaving(true); setError('')
     try {
       const min = Math.round(Number(minimum) * 100); const max = isNeed ? min : Math.round(Number(maximum || minimum) * 100)
-      await api('/api/listings', json({ kind, amount_min: min, amount_max: max, location, availability, note, ...(coordinates || {}) }))
+      await api('/api/listings', json({ kind, amount_min: min, amount_max: max, location, availability, note, search_radius_km: searchRadius, ...(coordinates || {}) }))
       navigate('home')
     } catch (failure) { setError(failure instanceof Error ? failure.message : 'Could not publish this listing') } finally { setSaving(false) }
   }
@@ -416,6 +530,16 @@ function ListingForm({ kind, locationLabel, coordinates, navigate, setError }: {
     <form className="panel stack-form" onSubmit={submit}>
       <label>{isNeed ? 'Cash amount' : 'Available cash'}<div className="money-input"><span>₹</span><input type="number" required min="1" max="2500" step="1" value={minimum} onChange={(e) => setMinimum(e.target.value)} placeholder="500"/></div><small className="field-hint">Choose an amount from ₹1 to ₹2,500 for this exchange.</small></label>
       {!isNeed && <label>Minimum amount for partial exchanges <span className="optional">(optional)</span><div className="money-input"><span>₹</span><input type="number" min="1" max="2500" step="1" value={maximum} onChange={(e) => setMaximum(e.target.value)} placeholder="Same as available cash"/></div></label>}
+      <label>Search radius
+        <div className="radius-selector">
+          {[1, 2, 5, 10, 25, 50].map((r) => (
+            <button key={r} type="button" className={`radius-chip ${searchRadius === r ? 'active' : ''}`} onClick={() => setSearchRadius(r)}>
+              {r} km
+            </button>
+          ))}
+        </div>
+        <small className="field-hint">Find matches within {searchRadius} km of your campus/location.</small>
+      </label>
       <label>Meeting location<input required minLength={2} maxLength={180} value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Library entrance, Aditya University"/><small className="field-hint">Use a public place. If location is enabled, ONPay uses a rounded approximate position for nearby matching; exact coordinates are never shown.</small></label>
       <label>Preferred time<input required maxLength={120} value={availability} onChange={(e) => setAvailability(e.target.value)} placeholder="Today after 3 PM"/></label>
       <label>Note <span className="optional">(optional)</span><textarea maxLength={500} rows={3} value={note} onChange={(e) => setNote(e.target.value)} placeholder={isNeed ? 'e.g. Need cash for lunch' : 'e.g. Can meet near the main gate'}/></label>
@@ -435,6 +559,8 @@ function MatchesPage({ coordinates, geoStatus, navigate, setSelectedListing, set
   const [loadError, setLoadError] = useState('')
   const [retry, setRetry] = useState(0)
   const [busyId, setBusyId] = useState('')
+  const [matchFailure, setMatchFailure] = useState<{ listingId: string; message: string } | null>(null)
+  const matching = useRef(false)
   const [sort, setSort] = useState('recent')
   const load = useCallback(async () => {
     setLoading(true); setLoadError('')
@@ -451,31 +577,55 @@ function MatchesPage({ coordinates, geoStatus, navigate, setSelectedListing, set
   useEffect(() => { load() }, [load])
   const ordered = useMemo(() => [...listings].sort((a, b) => sort === 'amount' ? a.amount_min - b.amount_min : 0), [listings, sort])
   const match = async (listing: Listing) => {
+    if (matching.current) return
     const expectedKind = listing.kind === 'need' ? 'have' : 'need'
     const ownListing = mine.find((item) => item.kind === expectedKind && Math.max(item.amount_min, listing.amount_min) <= Math.min(item.amount_max, listing.amount_max))
     if (!ownListing) { setError(`Create an active ${expectedKind === 'have' ? 'cash offer' : 'cash request'} with a compatible amount first.`); navigate(expectedKind); return }
     const amount = Math.max(ownListing.amount_min, listing.amount_min)
-    setBusyId(listing.id); setError('')
-    try { const data = await api(`/api/listings/${listing.id}/accept`, json({ amount })); setSelectedExchange(data.exchange); navigate('meetup') }
-    catch (failure) { setError(failure instanceof Error ? failure.message : 'This match is no longer available') }
-    finally { setBusyId('') }
+    matching.current = true
+    setBusyId(listing.id); setError(''); setMatchFailure(null)
+    try {
+      await matchAndNavigate(api, listing.id, amount, setSelectedExchange, navigate, () => { void load() })
+    } catch (failure) {
+      const message = failure instanceof Error ? failure.message : 'This match is no longer available'
+      setError(message); setMatchFailure({ listingId: listing.id, message })
+    } finally { matching.current = false; setBusyId('') }
   }
   return <div className="page-stack"><PageTitle title="Nearby matches" subtitle={coordinates ? 'Active listings within 25 km of your approximate current area.' : geoStatus === 'denied' ? 'Location is blocked; browse all listings or choose a campus area.' : 'Enable location to filter by distance, or browse all active listings.'}/>
     <div className="filter-row">{[['all', 'All'], ['need', 'Need cash'], ['have', 'Have cash']].map(([value, label]) => <button key={value} className={`filter-chip ${filter === value ? 'selected' : ''}`} onClick={() => setFilter(value)}>{label}</button>)}</div>
     <form className="match-filter-panel" onSubmit={(event) => { event.preventDefault(); setFilters({ ...draft }) }}><label>Minimum ₹<input type="number" min="1" step="1" value={draft.minimum} onChange={(event) => setDraft({ ...draft, minimum: event.target.value })} placeholder="Any"/></label><label>Maximum ₹<input type="number" min="1" step="1" value={draft.maximum} onChange={(event) => setDraft({ ...draft, maximum: event.target.value })} placeholder="Any"/></label><label>Campus or area<input maxLength={120} value={draft.location} onChange={(event) => setDraft({ ...draft, location: event.target.value })} placeholder="Any meeting area"/></label><label>Preferred time<input maxLength={80} value={draft.availability} onChange={(event) => setDraft({ ...draft, availability: event.target.value })} placeholder="Any time"/></label><button className="button button-soft">Apply filters</button><button type="button" className="text-action" onClick={() => { const clear = { minimum: '', maximum: '', location: '', availability: '' }; setDraft(clear); setFilters(clear) }}>Clear</button></form>
     <div className="sort-row"><span>{listings.length} {listings.length === 1 ? 'listing' : 'listings'}</span><label>Sort <select value={sort} onChange={(e) => setSort(e.target.value)}><option value="recent">Recently posted</option><option value="amount">Amount</option></select></label></div>
-    {loading ? <div className="loading-inline"><span className="spinner"/>Finding matches…</div> : loadError ? <p className="inline-error" role="alert">{loadError} <button className="text-action" onClick={() => setRetry((value) => value + 1)}>Try again</button></p> : ordered.length ? <div className="match-list">{ordered.map((listing) => <article key={listing.id} className="match-card"><ListingCard listing={listing} onClick={() => { setSelectedListing(listing); navigate('student') }}/><div className="match-detail"><span><Icon name="clock" size={15}/> {listing.availability}</span><span><Icon name="pin" size={15}/> {listing.location}</span></div><div className="match-buttons"><button className="button button-soft" onClick={() => { setSelectedListing(listing); navigate('student') }}>View details</button><button className="button button-primary" disabled={busyId === listing.id} onClick={() => match(listing)}>{busyId === listing.id ? 'Matching…' : 'Match'}</button></div></article>)}</div> : <EmptyState title="No matching listings" body="Try another filter or publish a request or offer so students can find you." action={<div className="empty-actions"><button className="button button-primary" onClick={() => navigate('need')}>I need cash</button><button className="button button-soft" onClick={() => navigate('have')}>I have cash</button></div>}/>}
+    {matchFailure && <p className="inline-error" role="alert">{matchFailure.message} <button className="text-action" disabled={busyId !== ''} onClick={() => { const listing = ordered.find((item) => item.id === matchFailure.listingId); if (listing) void match(listing) }}>Retry match</button></p>}
+    {loading ? <div className="loading-inline"><span className="spinner"/>Finding matches…</div> : loadError ? <p className="inline-error" role="alert">{loadError} <button className="text-action" onClick={() => setRetry((value) => value + 1)}>Try again</button></p> : ordered.length ? <div className="match-list">{ordered.map((listing) => <article key={listing.id} className="match-card"><ListingCard listing={listing} onClick={() => { setSelectedListing(listing); navigate('student') }}/><div className="match-detail"><span><Icon name="clock" size={15}/> {listing.availability}</span><span><Icon name="pin" size={15}/> {listing.location}</span></div><div className="match-buttons"><button className="button button-soft" onClick={() => { setSelectedListing(listing); navigate('student') }}>View details</button><button className="button button-primary" disabled={busyId !== ''} onClick={() => match(listing)}>{busyId === listing.id ? 'Matching…' : 'Match'}</button></div></article>)}</div> : <EmptyState title="No matching listings" body="Try another filter or publish a request or offer so students can find you." action={<div className="empty-actions"><button className="button button-primary" onClick={() => navigate('need')}>I need cash</button><button className="button button-soft" onClick={() => navigate('have')}>I have cash</button></div>}/>}
   </div>
 }
 
 function StudentPage({ listing, navigate, setChatTarget, setError }: { listing: Listing; navigate: (screen: Screen) => void; setChatTarget: (id: string | null) => void; setError: (message: string) => void }) {
+  const [showMatchModal, setShowMatchModal] = useState(false)
   const reportOrBlock = async (action: 'report' | 'block') => {
     try {
       if (action === 'block') { await api('/api/blocks', json({ user_id: listing.owner.id })); setError('Student blocked. Their listings and messages are hidden from you.') }
       else { await api('/api/reports', json({ user_id: listing.owner.id, category: 'profile_report', details: '' })); setError('Thanks. Your report has been sent for review.') }
     } catch (failure) { setError(failure instanceof Error ? failure.message : 'Could not submit this request') }
   }
-  return <div className="page-stack"><button className="back-link" onClick={() => navigate('matches')}><Icon name="back" size={17}/> Back to matches</button><section className="student-profile panel"><Avatar name={listing.owner.full_name} size="lg"/><h1>{listing.owner.full_name}</h1><p>{listing.owner.college || 'Student'}</p>{listing.owner.verified && <span className="verified-label"><Icon name="shield" size={15}/> Contact verified</span>}<div className={`student-offer ${listing.kind}`}><span>{listing.kind === 'need' ? 'Needs cash' : 'Has cash'}</span><strong>{money(listing.amount_min)}{listing.amount_max !== listing.amount_min ? ` – ${money(listing.amount_max)}` : ''}</strong></div><div className="detail-row"><span>Meeting area</span><strong>{listing.location}</strong></div><div className="detail-row"><span>Availability</span><strong>{listing.availability}</strong></div>{listing.note && <div className="note-card">“{listing.note}”</div>}<p className="privacy-note"><Icon name="info" size={15}/> Ratings and exchange counts will appear only after real, verified exchanges.</p><button className="button button-primary button-wide" onClick={() => { setChatTarget(listing.owner.id); navigate('chats') }}>Message student <Icon name="chat"/></button><div className="moderation-links"><button onClick={() => reportOrBlock('report')}>Report</button><button onClick={() => reportOrBlock('block')}>Block</button></div></section></div>
+  return <div className="page-stack">
+    <button className="back-link" onClick={() => navigate('matches')}><Icon name="back" size={17}/> Back to matches</button>
+    <section className="student-profile panel">
+      <Avatar name={listing.owner.full_name} size="lg"/>
+      <h1>{listing.owner.full_name}</h1>
+      <p>{listing.owner.college || 'Student'}</p>
+      {listing.owner.verified && <span className="verified-label"><Icon name="shield" size={15}/> Contact verified</span>}
+      <div className={`student-offer ${listing.kind}`}><span>{listing.kind === 'need' ? 'Needs cash' : 'Has cash'}</span><strong>{money(listing.amount_min)}{listing.amount_max !== listing.amount_min ? ` – ${money(listing.amount_max)}` : ''}</strong></div>
+      <div className="detail-row"><span>Meeting area</span><strong>{listing.location}</strong></div>
+      <div className="detail-row"><span>Availability</span><strong>{listing.availability}</strong></div>
+      {listing.note && <div className="note-card">“{listing.note}”</div>}
+      <p className="privacy-note"><Icon name="info" size={15}/> Ratings and exchange counts will appear only after real, verified exchanges.</p>
+      <button className="button button-primary button-wide" onClick={() => setShowMatchModal(true)}>Send Match Request <Icon name="arrow"/></button>
+      <button className="button button-soft button-wide" style={{ marginTop: '8px' }} onClick={() => { setChatTarget(listing.owner.id); navigate('chats') }}>Message student <Icon name="chat"/></button>
+      <div className="moderation-links"><button onClick={() => reportOrBlock('report')}>Report</button><button onClick={() => reportOrBlock('block')}>Block</button></div>
+    </section>
+    {showMatchModal && <SendMatchRequestModal listing={listing} onClose={() => setShowMatchModal(false)} onSuccess={() => { setShowMatchModal(false); navigate('home') }}/>}
+  </div>
 }
 
 function ChatsPage({ targetUserId, user, setChatTarget, setError }: { targetUserId: string | null; user: User; setChatTarget: (id: string | null) => void; setError: (message: string) => void }) {
@@ -483,6 +633,7 @@ function ChatsPage({ targetUserId, user, setChatTarget, setError }: { targetUser
   const [friends, setFriends] = useState<any[]>([])
   const [showFriends, setShowFriends] = useState(false)
   const [active, setActive] = useState<any>(null)
+  const [friendState, setFriendState] = useState<{ status: string; request_id: string | null }>({ status: 'none', request_id: null })
   const [messages, setMessages] = useState<any[]>([])
   const [body, setBody] = useState('')
   const [loading, setLoading] = useState(true)
@@ -492,16 +643,53 @@ function ChatsPage({ targetUserId, user, setChatTarget, setError }: { targetUser
     setLoading(true)
     try {
       const data = await api('/api/chats'); setChats(data.chats)
-      if (targetUserId) { const conversation = await api(`/api/chats/with/${targetUserId}`); setActive(conversation); setMessages(conversation.messages) }
-      else { setActive(null); setMessages([]) }
+      if (targetUserId) {
+        const conversation = await api(`/api/chats/with/${targetUserId}`); setActive(conversation); setMessages(conversation.messages)
+        const fStatus = await api(`/api/friends/status/${targetUserId}`); setFriendState(fStatus)
+      } else { setActive(null); setMessages([]); setFriendState({ status: 'none', request_id: null }) }
     } catch (failure) { setError(failure instanceof Error ? failure.message : 'Could not load chats') }
     finally { setLoading(false) }
   }, [targetUserId, setError])
   useEffect(() => { load() }, [load])
   useEffect(() => { if (showFriends) api('/api/friends').then((data) => setFriends(data.friends)).catch((failure) => setError(failure instanceof Error ? failure.message : 'Could not load friends')) }, [showFriends, setError])
   useEffect(() => { messagesEnd.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
-  const selectChat = async (chat: any) => { setChatTarget(chat.other_user.id); setActive(chat); try { const detail = await api(`/api/chats/${chat.id}`); setMessages(detail.messages) } catch (failure) { setError(failure instanceof Error ? failure.message : 'Could not open chat') } }
-  const selectFriend = async (friend: any) => { setChatTarget(friend.id); setShowFriends(false); try { const detail = await api(`/api/chats/with/${friend.id}`); setActive(detail); setMessages(detail.messages) } catch (failure) { setError(failure instanceof Error ? failure.message : 'Could not open chat') } }
+  const selectChat = async (chat: any) => {
+    setChatTarget(chat.other_user.id); setActive(chat)
+    try {
+      const detail = await api(`/api/chats/${chat.id}`); setMessages(detail.messages)
+      const fStatus = await api(`/api/friends/status/${chat.other_user.id}`); setFriendState(fStatus)
+    } catch (failure) { setError(failure instanceof Error ? failure.message : 'Could not open chat') }
+  }
+  const selectFriend = async (friend: any) => {
+    setChatTarget(friend.id); setShowFriends(false)
+    try {
+      const detail = await api(`/api/chats/with/${friend.id}`); setActive(detail); setMessages(detail.messages)
+      const fStatus = await api(`/api/friends/status/${friend.id}`); setFriendState(fStatus)
+    } catch (failure) { setError(failure instanceof Error ? failure.message : 'Could not open chat') }
+  }
+  const sendFriendReq = async () => {
+    const otherId = active?.other_user?.id
+    if (!otherId) return
+    try {
+      const res = await api(`/api/friends/request/${otherId}${active.exchange_id ? `?exchange_id=${active.exchange_id}` : ''}`, json({}))
+      setFriendState({ status: 'request_sent', request_id: res.request_id })
+    } catch (failure) { setError(failure instanceof Error ? failure.message : 'Could not send friend request') }
+  }
+  const acceptFriend = async () => {
+    if (!friendState.request_id) return
+    try {
+      await api(`/api/friends/requests/${friendState.request_id}/accept`, json({}))
+      setFriendState({ status: 'friends', request_id: null })
+      const data = await api('/api/friends'); setFriends(data.friends)
+    } catch (failure) { setError(failure instanceof Error ? failure.message : 'Could not accept friend request') }
+  }
+  const rejectFriend = async () => {
+    if (!friendState.request_id) return
+    try {
+      await api(`/api/friends/requests/${friendState.request_id}/reject`, json({}))
+      setFriendState({ status: 'none', request_id: null })
+    } catch (failure) { setError(failure instanceof Error ? failure.message : 'Could not decline friend request') }
+  }
   const moderate = async (action: 'report' | 'block') => {
     const otherId = active?.other_user?.id
     if (!otherId) return
@@ -516,7 +704,7 @@ function ChatsPage({ targetUserId, user, setChatTarget, setError }: { targetUser
     try { const result = await api(`/api/chats/with/${active.other_user.id}/messages${active.exchange_id ? `?exchange_id=${active.exchange_id}` : ''}`, json({ body })); setMessages((previous) => [...previous, result.message]); setBody(''); setActive((previous: any) => ({ ...previous, id: result.chat_id })); const data = await api('/api/chats'); setChats(data.chats) }
     catch (failure) { setError(failure instanceof Error ? failure.message : 'Could not send message') }
   }
-  if (active) return <div className="chat-screen"><div className="chat-top"><button className="icon-button" onClick={() => { setChatTarget(null); setActive(null); setActionsOpen(false) }}><Icon name="back"/></button><Avatar name={active.other_user?.full_name || 'Student'} size="sm"/><span><strong>{active.other_user?.full_name || 'Student'}</strong><small>{active.exchange_id ? 'Exchange chat' : active.other_user?.college || 'ONPay chat'}</small></span><button className="more-button" aria-label="Chat safety actions" onClick={() => setActionsOpen((open) => !open)}>•••</button></div>{actionsOpen && <div className="chat-safety-actions"><button onClick={() => moderate('report')}>Report student</button><button onClick={() => moderate('block')}>Block student</button></div>}<div className="chat-messages">{messages.length ? messages.map((message: any) => <div key={message.id} className={`message-bubble ${message.sender_id === user.id ? 'mine' : ''}`}>{message.body}<small>{new Date(message.created_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</small></div>) : <EmptyState icon="chat" title="Start a conversation" body="Keep exchange arrangements in ONPay chat. Never share your UPI PIN."/>}<div ref={messagesEnd}/></div><form className="chat-composer" onSubmit={send}><input value={body} onChange={(e) => setBody(e.target.value)} maxLength={2000} placeholder="Type a message…"/><button className="send-button" disabled={!body.trim()} aria-label="Send message"><Icon name="arrow"/></button></form></div>
+  if (active) return <div className="chat-screen"><div className="chat-top"><button className="icon-button" onClick={() => { setChatTarget(null); setActive(null); setActionsOpen(false) }}><Icon name="back"/></button><Avatar name={active.other_user?.full_name || 'Student'} size="sm"/><span><strong>{active.other_user?.full_name || 'Student'}</strong><small>{active.exchange_id ? 'Exchange chat' : active.other_user?.college || 'ONPay chat'}</small></span><div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '8px' }}>{friendState.status === 'friends' && <span className="friend-badge positive">✓ Friends</span>}{friendState.status === 'request_sent' && <span className="friend-badge neutral">Request Sent</span>}{friendState.status === 'request_received' && <div className="friend-inline-actions"><button className="friend-action-btn accept" onClick={acceptFriend}>Accept</button><button className="friend-action-btn reject" onClick={rejectFriend}>Decline</button></div>}{friendState.status === 'none' && <button className="friend-action-btn add" onClick={sendFriendReq}>+ Add Friend</button>}<button className="more-button" aria-label="Chat safety actions" onClick={() => setActionsOpen((open) => !open)}>•••</button></div></div>{actionsOpen && <div className="chat-safety-actions"><button onClick={() => moderate('report')}>Report student</button><button onClick={() => moderate('block')}>Block student</button></div>}<div className="chat-messages">{messages.length ? messages.map((message: any) => <div key={message.id} className={`message-bubble ${message.sender_id === user.id ? 'mine' : ''}`}>{message.body}<small>{new Date(message.created_at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</small></div>) : <EmptyState icon="chat" title="Start a conversation" body="Keep exchange arrangements in ONPay chat. Never share your UPI PIN."/>}<div ref={messagesEnd}/></div><form className="chat-composer" onSubmit={send}><input value={body} onChange={(e) => setBody(e.target.value)} maxLength={2000} placeholder="Type a message…"/><button className="send-button" disabled={!body.trim()} aria-label="Send message"><Icon name="arrow"/></button></form></div>
   return <div className="page-stack"><PageTitle title="Chats" subtitle="Coordinate an exchange before meeting."/><div className="segmented small-tabs"><button className={!showFriends ? 'selected' : ''} onClick={() => setShowFriends(false)}>Conversations</button><button className={showFriends ? 'selected' : ''} onClick={() => setShowFriends(true)}>Friends</button></div>{loading ? <div className="loading-inline"><span className="spinner"/>Loading {showFriends ? 'friends' : 'chats'}…</div> : showFriends ? friends.length ? <div className="chat-list">{friends.map((friend) => <button className="chat-row" key={friend.id} onClick={() => selectFriend(friend)}><Avatar name={friend.full_name}/><span><strong>{friend.full_name}</strong><small>{friend.college || 'Verified exchange friend'}</small></span><small className="chat-date">Message</small></button>)}</div> : <EmptyState icon="user" title="No friends yet" body="Students are added after an exchange has been independently verified."/> : chats.length ? <div className="chat-list">{chats.map((chat) => <button className="chat-row" key={chat.id} onClick={() => selectChat(chat)}><Avatar name={chat.other_user.full_name}/><span><strong>{chat.other_user.full_name}</strong><small>{chat.last_message}</small></span><small className="chat-date">{new Date(chat.updated_at).toLocaleDateString()}</small></button>)}</div> : <EmptyState icon="chat" title="No conversations yet" body="Open a student listing to start a chat. Your messages are visible only to the participants."/>}</div>
 }
 
@@ -540,7 +728,7 @@ function ScannerPage({ user, exchangesAction, navigate, payment, setPayment, set
   useEffect(() => {
     let active = true
     setExchangeLoading(true); setExchangeLoadError('')
-    api('/api/exchanges').then((data) => { if (active) { const available = data.exchanges.filter((exchange: Exchange) => exchange.status === 'meetup_confirmed' && exchange.requester_arrived && exchange.provider_arrived); setExchanges(available); if (available.length === 1) setExchangeId(available[0].id) } }).catch((failure) => { if (active) setExchangeLoadError(failure instanceof Error ? failure.message : 'Could not load exchanges for payment.') }).finally(() => { if (active) setExchangeLoading(false) })
+    api('/api/exchanges').then((data) => { if (active) { const available = data.exchanges.filter(isPaymentReadyExchange); setExchanges(available); if (available.length === 1) setExchangeId(available[0].id) } }).catch((failure) => { if (active) setExchangeLoadError(failure instanceof Error ? failure.message : 'Could not load exchanges for payment.') }).finally(() => { if (active) setExchangeLoading(false) })
     return () => { active = false }
   }, [exchangeRetry])
   const stopCamera = () => {
@@ -553,8 +741,13 @@ function ScannerPage({ user, exchangesAction, navigate, payment, setPayment, set
   }
   useEffect(() => () => stopCamera(), [])
   const parse = (value: string) => {
+    const trimmed = value.trim()
+    if (/^\+?[0-9]{10,13}$/.test(trimmed)) {
+      setError('You entered a mobile number instead of a UPI ID. A valid UPI ID (e.g. username@okhdfcbank or 9876543210@upi) is required. Consumer UPI apps fail with "Try using mobile number" if paid without a bank handle.')
+      return
+    }
     try {
-      const result = parseUpiPayload(value)
+      const result = parseUpiPayload(trimmed)
       setPayee({ upi: result.upi, name: result.name, amountPaise: result.amountPaise, currency: result.currency })
       setError('')
     } catch (failure) { setError(failure instanceof Error ? failure.message : 'Could not read this QR code.') }
@@ -633,6 +826,21 @@ function ScannerPage({ user, exchangesAction, navigate, payment, setPayment, set
   if (payment) return <PaymentPage payment={payment} setPayment={setPayment} navigate={navigate}/>
   return <div className="page-stack scanner-page"><PageTitle title="Scan UPI QR" subtitle="Review the payee and amount before opening a UPI app."/>
     <label className="field-label">Exchange<select className="select-control" value={exchangeId} onChange={(e) => { setExchangeId(e.target.value); setPayee(null) }}><option value="">Choose a confirmed meetup</option>{exchanges.filter((item) => item.requester_arrived && item.provider_arrived).map((exchange) => <option key={exchange.id} value={exchange.id}>{exchange.other_user?.full_name} · {money(exchange.amount)}</option>)}</select></label>
+    {selected && (
+      <div style={{ margin: '8px 0', padding: '10px 14px', background: 'var(--panel-bg, #f4f6f9)', borderRadius: '8px', fontSize: '13px' }}>
+        <div>Recipient: <strong>{selected.other_user?.full_name}</strong></div>
+        {(selected.other_user as any)?.upi_id ? (
+          <div style={{ marginTop: '4px' }}>
+            Registered UPI: <code>{(selected.other_user as any).upi_id}</code>
+            <button type="button" className="text-action" style={{ marginLeft: '8px' }} onClick={() => { setQrText((selected.other_user as any).upi_id); parse((selected.other_user as any).upi_id) }}>Use UPI ID</button>
+          </div>
+        ) : (
+          <div style={{ color: 'var(--muted)', marginTop: '4px' }}>
+            ⚠️ Note: Payee has not configured a default UPI ID in their profile. Scan their personal UPI QR code or enter their VPA.
+          </div>
+        )}
+      </div>
+    )}
     {exchangeLoadError ? <p className="inline-error" role="alert">{exchangeLoadError} <button className="text-action" onClick={() => setExchangeRetry((value) => value + 1)}>Try again</button></p> : exchangeLoading ? <div className="loading-inline"><span className="spinner"/>Loading confirmed meetups…</div> : !exchanges.length && <div className="inline-callout"><Icon name="info" size={17}/> Confirm both meetup arrivals before initiating a payment.</div>}
     <div className="scanner-preview"><video ref={videoRef} className="scanner-video" muted playsInline/><div className="scan-frame"><i/><i/><i/><i/></div><span className="scan-caption">{cameraLoading ? 'Opening camera…' : scanning ? 'Align a UPI QR inside the frame' : 'Camera scan is ready'}</span></div>
     <div className="scanner-actions"><button className="button button-soft" onClick={startCamera} disabled={cameraLoading || scanning}><Icon name="qr" size={18}/>{cameraLoading ? 'Opening camera…' : scanning ? 'Scanning…' : 'Open camera'}</button><label className="button button-soft file-choice">Choose image<input type="file" accept="image/*" onChange={(e) => { void importImage(e.target.files?.[0]); e.currentTarget.value = '' }}/></label></div>
@@ -674,7 +882,7 @@ function PaymentPage({ payment, setPayment, navigate }: { payment: Payment; setP
   return <div className="page-stack payment-page"><button className="back-link" onClick={() => navigate('transactions')}><Icon name="back" size={17}/> Transactions</button><section className="payment-status-card"><div className={`status-illustration ${pending ? 'pending' : completed ? 'success' : ''}`}><Icon name={completed ? 'check' : pending ? 'clock' : 'qr'} size={32}/></div><span className="eyebrow">{success ? 'PAYMENT VERIFIED' : receiverConfirmed ? 'RECIPIENT CONFIRMED' : failed ? 'PAYMENT FAILED' : pending ? 'VERIFICATION PENDING' : 'PAYMENT INITIATED'}</span><h1>{money(payment.amount)}</h1><p>{success ? 'This payment was independently reconciled.' : receiverConfirmed ? 'The recipient confirmed receipt after checking their UPI app or bank account. This is not independent bank verification.' : failed ? 'This attempt was marked failed by a configured provider.' : pending ? 'We have not verified that the payment reached the recipient.' : 'Complete the payment in your UPI app, then return here.'}</p><div className="reference-block"><small>ONPay reference</small><strong>{payment.reference}</strong></div>{paymentStatus === 'payment_initiated' && <a className="button button-primary button-wide" href={payment.upi_uri} onClick={launchUpiApp}>Open UPI app <Icon name="arrow"/></a>}{launchMessage && <p className="inline-error" role="status">{launchMessage}</p>}{refreshError && <p className="inline-error" role="alert">{refreshError} The displayed status is the last status confirmed by ONPay.</p>}{!completed && <button className="button button-soft button-wide" onClick={refresh} disabled={loading}>{loading ? 'Checking…' : paymentStatus === 'payment_initiated' ? 'I’m back in ONPay' : 'Refresh status'}</button>}{completed && <button className="button button-primary button-wide" onClick={() => { setPayment(null); navigate('meetup') }}>View exchange <Icon name="arrow"/></button>}<div className="inline-callout"><Icon name="info" size={17}/>{payment.verification_note || 'Returning from a payment app does not verify settlement.'}</div></section>{!completed && <button className="text-action centered" onClick={() => { setPayment(null); navigate('meetup') }}>View meetup details <Icon name="arrow" size={15}/></button>}</div>
 }
 
-function TransactionsPage({ navigate, setSelectedExchange }: { navigate: (screen: Screen) => void; setSelectedExchange: (exchange: Exchange) => void }) {
+function TransactionsPage({ coordinates, navigate, setSelectedListing, setSelectedExchange }: { coordinates: Coordinates | null; navigate: (screen: Screen) => void; setSelectedListing: (listing: Listing) => void; setSelectedExchange: (exchange: Exchange) => void }) {
   const [filter, setFilter] = useState('all')
   const [items, setItems] = useState<Exchange[]>([])
   const [loading, setLoading] = useState(true)
@@ -684,18 +892,72 @@ function TransactionsPage({ navigate, setSelectedExchange }: { navigate: (screen
   const [retry, setRetry] = useState(0)
   const [nextOffset, setNextOffset] = useState(0)
   const [hasMore, setHasMore] = useState(false)
+  const [availableListings, setAvailableListings] = useState<Listing[]>([])
+  const [ownListings, setOwnListings] = useState<Listing[]>([])
+  const [listingsLoading, setListingsLoading] = useState(true)
+  const [listingsError, setListingsError] = useState('')
+  const [listingsRetry, setListingsRetry] = useState(0)
+  const [matchingId, setMatchingId] = useState('')
+  const [matchFailureId, setMatchFailureId] = useState('')
+  const [matchError, setMatchError] = useState('')
+  const [listingSetupKind, setListingSetupKind] = useState<'need' | 'have' | null>(null)
+  const matching = useRef(false)
   useEffect(() => {
     let alive = true
     setLoading(true); setLoadError(''); setItems([]); setNextOffset(0); setHasMore(false)
     api(`/api/transactions?status_filter=${filter}&offset=0&limit=30`).then((data) => { if (alive) { setItems(data.transactions); setNextOffset(data.next_offset); setHasMore(data.has_more); setLoadError('') } }).catch((failure) => { if (alive) setLoadError(failure instanceof Error ? failure.message : 'Could not load transactions.') }).finally(() => { if (alive) setLoading(false) })
     return () => { alive = false }
   }, [filter, retry])
+  useEffect(() => {
+    let alive = true
+    setListingsLoading(true); setListingsError('')
+    Promise.all([fetchAvailableListings<Listing>(api, coordinates), api('/api/my-listings')])
+      .then(([available, own]) => {
+        if (alive) {
+          setAvailableListings(available)
+          setOwnListings(own.listings.filter((listing: Listing) => listing.status === 'active'))
+        }
+      })
+      .catch((failure) => {
+        if (alive) setListingsError(failure instanceof Error ? failure.message : 'Could not load available listings.')
+      })
+      .finally(() => { if (alive) setListingsLoading(false) })
+    return () => { alive = false }
+  }, [coordinates, listingsRetry])
   const loadMore = async () => { setLoadingMore(true); setLoadMoreError(''); try { const data = await api(`/api/transactions?status_filter=${filter}&offset=${nextOffset}&limit=30`); setItems((current) => [...current, ...data.transactions]); setNextOffset(data.next_offset); setHasMore(data.has_more) } catch (failure) { setLoadMoreError(failure instanceof Error ? failure.message : 'Could not load more transactions.') } finally { setLoadingMore(false) } }
   const open = (exchange: Exchange) => { setSelectedExchange(exchange); navigate('meetup') }
+  const match = async (listing: Listing) => {
+    if (matching.current) return
+    const expectedKind = listing.kind === 'need' ? 'have' : 'need'
+    const ownListing = ownListings.find((item) => item.kind === expectedKind && Math.max(item.amount_min, listing.amount_min) <= Math.min(item.amount_max, listing.amount_max))
+    if (!ownListing) {
+      setListingSetupKind(expectedKind)
+      setMatchError(`Create a compatible active ${expectedKind === 'have' ? 'cash offer' : 'cash request'} before matching.`)
+      return
+    }
+    matching.current = true
+    setMatchingId(listing.id); setMatchFailureId(''); setMatchError(''); setListingSetupKind(null)
+    try {
+      await matchAndNavigate(api, listing.id, Math.max(ownListing.amount_min, listing.amount_min), setSelectedExchange, navigate, () => {
+        void fetchAvailableListings<Listing>(api, coordinates)
+          .then(setAvailableListings)
+          .catch((failure) => setListingsError(failure instanceof Error ? failure.message : 'Could not refresh available listings.'))
+      })
+    } catch (failure) {
+      setMatchFailureId(listing.id)
+      setMatchError(failure instanceof Error ? failure.message : 'Could not match this listing. Please try again.')
+    } finally { matching.current = false; setMatchingId('') }
+  }
   const statusLabel = (item: Exchange) => item.status === 'success' ? 'Bank/provider verified' : item.status === 'receiver_confirmed' ? 'Completed · recipient confirmed' : item.payment_status === 'receiver_confirmed' ? 'Recipient confirmed · handover pending' : item.status.replaceAll('_', ' ')
   return (
     <div className="page-stack">
       <PageTitle title="Transactions" subtitle="A record of exchanges and their separate payment states."/>
+      <section className="section-block activity-listings">
+        <div className="section-title"><div><h2>Available requests & offers</h2><p>Active listings you can still match with.</p></div><button className="text-action" onClick={() => setListingsRetry((value) => value + 1)} disabled={listingsLoading}>Refresh</button></div>
+        {listingsError && <p className="inline-error" role="alert">{listingsError} <button className="text-action" onClick={() => setListingsRetry((value) => value + 1)}>Try again</button></p>}
+        {matchError && <p className="inline-error" role="alert">{matchError} {listingSetupKind ? <button className="text-action" onClick={() => navigate(listingSetupKind)}>Create listing</button> : matchFailureId ? <button className="text-action" disabled={matchingId !== ''} onClick={() => { const listing = availableListings.find((item) => item.id === matchFailureId); if (listing) void match(listing) }}>Retry match</button> : null}</p>}
+        {listingsLoading ? <div className="loading-inline"><span className="spinner"/>Loading available listings…</div> : listingsError ? null : availableListings.length ? <div className="match-list">{availableListings.map((listing) => <article key={listing.id} className="match-card"><ListingCard listing={listing} onClick={() => { setSelectedListing(listing); navigate('student') }}/><div className="match-buttons"><button className="button button-soft" onClick={() => { setSelectedListing(listing); navigate('student') }}>View details</button><button className="button button-primary" disabled={matchingId !== ''} onClick={() => void match(listing)}>{matchingId === listing.id ? 'Matching…' : 'Match'}</button></div></article>)}</div> : <EmptyState title="No available requests or offers" body="Only active listings that are still eligible for matching appear here." action={<button className="button button-soft" onClick={() => navigate('matches')}>Browse listings</button>}/>}
+      </section>
       <div className="filter-row status-filters">{[['all', 'All'], ['success', 'Completed'], ['in_transit', 'In transit'], ['failed', 'Failed']].map(([key, label]) => <button key={key} className={`filter-chip ${filter === key ? 'selected' : ''}`} onClick={() => setFilter(key)}>{label}</button>)}</div>
       {loadError && <p className="inline-error" role="alert">{loadError} <button className="text-action" onClick={() => setRetry((value) => value + 1)}>Try again</button></p>}
       {loading ? (
@@ -749,8 +1011,57 @@ function MeetupPage({ user, selected, setSelected, navigate, setError }: { user:
       <div className="detail-row"><span><Icon name="pin" size={16}/> Meeting location</span><strong>{exchange.location}</strong></div><div className="detail-row"><span><Icon name="clock" size={16}/> Preferred time</span><strong>{exchange.meetup_at}</strong></div>
       <a className="map-link" href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(exchange.location)}`} target="_blank" rel="noreferrer">Open directions <Icon name="arrow" size={15}/></a>
       <div className="confirm-step"><span className={`step-icon ${arrived ? 'done' : ''}`}><Icon name={arrived ? 'check' : 'pin'} size={18}/></span><div><strong>Confirm you’ve arrived</strong><small>{bothArrived ? 'Both participants confirmed arrival.' : 'This only confirms your meetup arrival.'}</small></div><button className={`button ${arrived ? 'button-soft' : 'button-primary'}`} disabled={busy || arrived || ['cancelled', 'disputed'].includes(exchange.status)} onClick={() => update(`/api/exchanges/${exchange.id}/arrival`, patch({ arrived: true }))}>{arrived ? 'Confirmed' : 'I’ve arrived'}</button></div>
-      {bothArrived && <div className="confirm-step"><span className={`step-icon ${cashDone ? 'done' : ''}`}><Icon name={cashDone ? 'check' : 'receipt'} size={18}/></span><div><strong>Cash handover</strong><small>{bothCash ? 'Both participants confirmed the cash handover.' : 'Confirm only after the physical cash is exchanged.'}</small></div><button className={`button ${cashDone ? 'button-soft' : 'button-green'}`} disabled={busy || cashDone || exchange.status === 'disputed'} onClick={() => update(`/api/exchanges/${exchange.id}/cash-confirmation`, patch({ handed_over: true }))}>{cashDone ? 'Recorded' : 'Confirm cash'}</button></div>}
       {requester && bothArrived && <button className="button button-primary button-wide" onClick={() => navigate('scan')}><Icon name="qr"/> Scan UPI QR to pay</button>}
+
+      {/* Dual Confirmation Section */}
+      <div className="dual-confirm-box">
+        <h3>Dual Transaction Confirmation</h3>
+        <div className="confirm-status-grid">
+          <div className={`confirm-status-item ${(exchange as any).seeker_cash_received ? 'confirmed' : 'pending'}`}>
+            <span className="status-label">Physical Cash (Seeker)</span>
+            <span className="status-val">{(exchange as any).seeker_cash_received ? '✓ Received' : 'Pending'}</span>
+          </div>
+          <div className={`confirm-status-item ${(exchange as any).provider_upi_received ? 'confirmed' : 'pending'}`}>
+            <span className="status-label">UPI Amount (Provider)</span>
+            <span className="status-val">{(exchange as any).provider_upi_received ? '✓ Received' : 'Pending'}</span>
+          </div>
+        </div>
+
+        {requester ? (
+          <button
+            className="btn-dual-confirm seeker-btn"
+            disabled={busy || (exchange as any).seeker_cash_received || ['cancelled', 'disputed'].includes(exchange.status)}
+            onClick={() => update(`/api/exchanges/${exchange.id}/confirm-cash-received`, { method: 'POST' }, 'Physical cash receipt confirmed!')}
+          >
+            {(exchange as any).seeker_cash_received ? '✓ You Confirmed Cash Receipt' : 'RECEIVED CASH'}
+          </button>
+        ) : (
+          <button
+            className="btn-dual-confirm provider-btn"
+            disabled={busy || (exchange as any).provider_upi_received || ['cancelled', 'disputed'].includes(exchange.status)}
+            onClick={() => update(`/api/exchanges/${exchange.id}/confirm-upi-received`, { method: 'POST' }, 'UPI payment receipt confirmed!')}
+          >
+            {(exchange as any).provider_upi_received ? '✓ You Confirmed UPI Receipt' : 'RECEIVED AMOUNT VIA UPI'}
+          </button>
+        )}
+      </div>
+
+      {(exchange.status === 'COMPLETED' || ((exchange as any).seeker_cash_received && (exchange as any).provider_upi_received)) && (
+        <section className="completion-receipt">
+          <div className="receipt-badge">✓</div>
+          <div className="receipt-title">TRANSACTION COMPLETED SUCCESSFULLY</div>
+          <div className="receipt-meta">Mutually confirmed peer-to-peer physical cash exchange</div>
+          <div className="receipt-details">
+            <div className="receipt-row"><span>Exchange ID</span><strong>{exchange.id.slice(0, 13)}…</strong></div>
+            <div className="receipt-row"><span>Amount</span><strong>{money(exchange.amount)}</strong></div>
+            <div className="receipt-row"><span>Cash Seeker</span><strong>{requester ? `${user.full_name} (You)` : (exchange.other_user?.full_name || 'Student')}</strong></div>
+            <div className="receipt-row"><span>Cash Provider</span><strong>{!requester ? `${user.full_name} (You)` : (exchange.other_user?.full_name || 'Student')}</strong></div>
+            <div className="receipt-row"><span>Location</span><strong>{exchange.location}</strong></div>
+            {(exchange as any).completed_at && <div className="receipt-row"><span>Completed at</span><strong>{new Date((exchange as any).completed_at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}</strong></div>}
+          </div>
+        </section>
+      )}
+
       <div className="payment-disclaimer"><Icon name="info" size={17}/><span>A recipient confirmation records what the recipient checked in their own UPI app or bank account. It is not independent bank/provider verification.</span></div>
       {detail?.payments?.map((item: any) => <div className="payment-history-item" key={item.id}><span>{item.reference}{item.receiver_confirmed_at && <small>Received {new Date(item.receiver_confirmed_at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}</small>}</span><b>{item.status === 'success' ? 'bank/provider verified' : item.status === 'receiver_confirmed' ? 'recipient confirmed' : item.status.replaceAll('_', ' ')}</b><small>{money(item.amount)}</small>{item.can_confirm_receipt && <div className="receipt-confirm-action"><small>Check your UPI app or bank account before confirming.</small><button className="button button-green" disabled={busy} onClick={() => { if (window.confirm(`Confirm you received ${money(item.amount)} in your UPI app or bank account? Only continue after you have checked.`)) update(`/api/payments/${item.id}/confirm-received`, { method: 'POST' }) }}>I received the money</button></div>}</div>)}
       {exchange.status === 'awaiting_meetup' || exchange.status === 'meetup_confirmed' ? <button className="text-action cancel-action" onClick={() => update(`/api/exchanges/${exchange.id}/cancel`, { method: 'POST' })}>Cancel exchange</button> : null}
@@ -784,8 +1095,18 @@ function ProfilePage({ user, setUser, navigate, signOut, setError }: { user: Use
   const [editing, setEditing] = useState(false)
   const [name, setName] = useState(user.full_name)
   const [college, setCollege] = useState(user.college || '')
-  const save = async (event: FormEvent) => { event.preventDefault(); try { const result = await api('/api/profile', patch({ full_name: name, college })); setUser(result.user); setEditing(false) } catch (failure) { setError(failure instanceof Error ? failure.message : 'Could not update profile') } }
-  return <div className="page-stack"><PageTitle title="Profile" subtitle="Your account, privacy, and exchange settings."/><section className="profile-card panel"><div className="profile-main"><Avatar name={user.full_name} size="lg"/><div><h2>{user.full_name}</h2><p>{user.college || 'College not added'}</p><span className="verified-label"><Icon name="shield" size={14}/>{user.verified_email || user.verified_phone ? 'Contact verified' : 'Contact not verified'}</span></div><button className="icon-button" onClick={() => setEditing((value) => !value)} aria-label="Edit profile"><Icon name="settings"/></button></div>{editing ? <form className="stack-form edit-profile" onSubmit={save}><label>Full name<input required value={name} onChange={(e) => setName(e.target.value)}/></label><label>College <span className="optional">(optional)</span><input value={college} onChange={(e) => setCollege(e.target.value)}/></label><button className="button button-primary">Save profile</button></form> : <div className="profile-contact"><span>{user.phone || user.email}</span><span className="status-pill neutral">Verified</span></div>}<div className="profile-stats"><div><b>{user.completed_exchanges}</b><small>Exchanges</small></div><div><b>{user.points}</b><small>Points</small></div><div><b>{user.friends_count}</b><small>Friends</small></div></div></section>
+  const [upiId, setUpiId] = useState(user.upi_id || '')
+  const save = async (event: FormEvent) => {
+    event.preventDefault()
+    try {
+      const result = await api('/api/profile', patch({ full_name: name, college, upi_id: upiId || null }))
+      setUser(result.user)
+      setEditing(false)
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : 'Could not update profile')
+    }
+  }
+  return <div className="page-stack"><PageTitle title="Profile" subtitle="Your account, privacy, and exchange settings."/><section className="profile-card panel"><div className="profile-main"><Avatar name={user.full_name} size="lg"/><div><h2>{user.full_name}</h2><p>{user.college || 'College not added'}</p><span className="verified-label"><Icon name="shield" size={14}/>{user.verified_email || user.verified_phone ? 'Contact verified' : 'Contact not verified'}</span></div><button className="icon-button" onClick={() => setEditing((value) => !value)} aria-label="Edit profile"><Icon name="settings"/></button></div>{editing ? <form className="stack-form edit-profile" onSubmit={save}><label>Full name<input required value={name} onChange={(e) => setName(e.target.value)}/></label><label>College <span className="optional">(optional)</span><input value={college} onChange={(e) => setCollege(e.target.value)}/></label><label>UPI ID (to receive digital payments) <span className="optional">(optional)</span><input value={upiId} onChange={(e) => setUpiId(e.target.value)} placeholder="e.g. name@okaxis"/><small className="field-hint">Required if offering cash to receive payments from seekers.</small></label><button className="button button-primary">Save profile</button></form> : <><div className="profile-contact"><span>{user.phone || user.email}</span><span className="status-pill neutral">Verified</span></div><div className="profile-contact" style={{ marginTop: '8px' }}><span>{user.upi_id ? `UPI: ${user.upi_id}` : 'No UPI ID configured'}</span><span className={`status-pill ${user.upi_id ? 'positive' : 'neutral'}`}>{user.upi_id ? 'Configured' : 'Not set'}</span></div></>}<div className="profile-stats"><div><b>{user.completed_exchanges}</b><small>Exchanges</small></div><div><b>{user.points}</b><small>Points</small></div><div><b>{user.friends_count}</b><small>Friends</small></div></div></section>
     <section className="menu-list"><MenuRow icon="receipt" title="Transactions" subtitle="Exchange and payment history" onClick={() => navigate('transactions')}/><MenuRow icon="heart" title="My friends" subtitle="People from verified exchanges" onClick={() => navigate('chats')}/><MenuRow icon="shield" title="Subscription plans" subtitle={`Current plan: ${user.plan.toUpperCase()}`} onClick={() => navigate('subscriptions')}/><MenuRow icon="star" title="Points & rewards" subtitle="View your points ledger" onClick={() => navigate('points')}/><MenuRow icon="pin" title="Location settings" subtitle="Choose a campus or meeting area" onClick={() => navigate('location')}/><MenuRow icon="info" title="Help & safety" subtitle="Support, reports, and meetup guidance" onClick={() => navigate('help')}/></section>
     <button className="button button-soft button-wide logout-button" onClick={signOut}>Log out</button><p className="account-note">ONPay does not hold funds or guarantee that a student has cash available.</p>
   </div>
@@ -799,9 +1120,232 @@ function SubscriptionsPage() {
   const [data, setData] = useState<any>(null)
   const [loadError, setLoadError] = useState('')
   const [retry, setRetry] = useState(0)
-  useEffect(() => { let active = true; setLoadError(''); api('/api/subscriptions').then((result) => { if (active) setData(result) }).catch((failure) => { if (active) setLoadError(failure instanceof Error ? failure.message : 'Could not load plan information.') }); return () => { active = false } }, [retry])
+  const [selectedPlan, setSelectedPlan] = useState<any>(null)
+  const [upiRef, setUpiRef] = useState('')
+  const [proofFile, setProofFile] = useState<File | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+  const [submitError, setSubmitError] = useState('')
+  const [copied, setCopied] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    setLoadError('')
+    api('/api/subscriptions')
+      .then((result) => { if (active) setData(result) })
+      .catch((failure) => { if (active) setLoadError(failure instanceof Error ? failure.message : 'Could not load plan information.') })
+    return () => { active = false }
+  }, [retry])
+
   const priceLabel = (plan: any) => plan.price_inr === null ? 'Pricing not configured' : `₹${Number(plan.price_inr).toLocaleString('en-IN')}`
-  return <div className="page-stack"><PageTitle title="Plans" subtitle="Completed exchanges count toward your calendar-month allowance."/>{loadError && <p className="inline-error" role="alert">{loadError} <button className="text-action" onClick={() => setRetry((value) => value + 1)}>Try again</button></p>}{data ? <><div className="plan-usage"><span>Current plan</span><strong>{data.current_plan.toUpperCase()}</strong><small>{data.remaining === null ? `${data.usage} completed this month · unlimited allowance` : `${data.usage} completed · ${data.reserved} active exchange(s) reserved · ${data.remaining} available this month (limit ${data.limit})`}</small></div><div className="plan-grid">{data.plans.map((plan: any) => <article className={`plan-card ${data.current_plan === plan.id ? 'current' : ''}`} key={plan.id}><span className="plan-name">{plan.name}{data.current_plan === plan.id && <small>Current plan</small>}</span><strong className="plan-price">{priceLabel(plan)}<small>{plan.period ? ` / ${plan.period}` : ' · billing interval not configured'}</small></strong><span className="plan-limit">{plan.limit === null ? 'Unlimited qualifying transactions' : `Up to ${plan.limit} completed transactions / ${plan.period || 'month'}`}</span>{plan.id !== 'free' && plan.id !== data.current_plan && <button className="button button-soft button-wide" disabled={!data.billing_configured} title="Subscription billing is not configured">{data.billing_configured ? 'Upgrade' : 'Upgrade unavailable'}</button>}</article>)}</div><div className="inline-callout"><Icon name="info" size={16}/>Plus is ₹199 per month. Pro pricing and billing interval appear only when configured. Paid checkout is unavailable, so no plan can be activated from this page.</div><p className="fine-print">Calendar-month allowances reset at midnight India time. Failed and cancelled exchanges do not count. Active exchanges temporarily reserve capacity to prevent overbooking.</p></> : !loadError ? <div className="loading-inline"><span className="spinner"/>Loading plans…</div> : <EmptyState title="Plans unavailable" body="Could not load plan information."/>}</div>
+
+  const handleCopyUpi = (upiId: string) => {
+    navigator.clipboard.writeText(upiId)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
+  const handleCheckoutSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!selectedPlan || !proofFile || !upiRef.trim()) {
+      setSubmitError('Please upload a screenshot and enter your UPI reference number.')
+      return
+    }
+    setSubmitting(true)
+    setSubmitError('')
+    try {
+      const formData = new FormData()
+      formData.append('plan_name', selectedPlan.id)
+      formData.append('upi_ref', upiRef.trim())
+      formData.append('proof', proofFile)
+
+      await api('/api/subscriptions/payment-request', {
+        method: 'POST',
+        body: formData,
+      })
+      setSelectedPlan(null)
+      setUpiRef('')
+      setProofFile(null)
+      setRetry((v) => v + 1)
+    } catch (err: any) {
+      setSubmitError(err.message || 'Payment submission failed. Please try again.')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="page-stack">
+      <PageTitle title="Plans" subtitle="Completed exchanges count toward your calendar-month allowance." />
+      {loadError && (
+        <p className="inline-error" role="alert">
+          {loadError} <button className="text-action" onClick={() => setRetry((value) => value + 1)}>Try again</button>
+        </p>
+      )}
+
+      {data ? (
+        <>
+          {data.pending_request && (
+            <div className="pending-subscription-card">
+              <div className="pending-sub-header">
+                <span className="pending-sub-badge">PAYMENT UNDER REVIEW</span>
+                <span className="pending-sub-target">⏱ Review target: ~20 mins</span>
+              </div>
+              <div className="pending-sub-body">
+                <h4>{data.pending_request.plan_name.toUpperCase()} Plan Subscription</h4>
+                <p>
+                  Amount: <strong>₹{data.pending_request.amount}</strong> · UPI UTR: <code>{data.pending_request.upi_ref}</code>
+                </p>
+                <small>
+                  Submitted on {new Date(data.pending_request.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.
+                  Our team is verifying your payment with the bank statement. Your plan entitlements will activate automatically upon approval.
+                </small>
+              </div>
+            </div>
+          )}
+
+          <div className="plan-usage">
+            <span>Current plan</span>
+            <strong>{data.current_plan.toUpperCase()}</strong>
+            <small>
+              {data.remaining === null
+                ? `${data.usage} completed this month · unlimited allowance`
+                : `${data.usage} completed · ${data.reserved} active exchange(s) reserved · ${data.remaining} available this month (limit ${data.limit})`}
+            </small>
+          </div>
+
+          <div className="plan-grid">
+            {data.plans.map((plan: any) => (
+              <article className={`plan-card ${data.current_plan === plan.id ? 'current' : ''}`} key={plan.id}>
+                <span className="plan-name">
+                  {plan.name}
+                  {data.current_plan === plan.id && <small>Current plan</small>}
+                </span>
+                <strong className="plan-price">
+                  {priceLabel(plan)}
+                  <small>{plan.period ? ` / ${plan.period}` : ' · billing interval not configured'}</small>
+                </strong>
+                <span className="plan-limit">
+                  {plan.limit === null ? 'Unlimited qualifying transactions' : `Up to ${plan.limit} completed transactions / ${plan.period || 'month'}`}
+                </span>
+                {plan.id !== 'free' && plan.id !== data.current_plan && (
+                  <button
+                    className="button button-soft button-wide"
+                    disabled={!data.billing_configured || Boolean(data.pending_request)}
+                    title={
+                      data.pending_request
+                        ? 'You already have a subscription payment under review'
+                        : !data.billing_configured
+                        ? 'Subscription billing is not configured'
+                        : 'Upgrade to this plan'
+                    }
+                    onClick={() => {
+                      if (data.billing_configured && !data.pending_request) {
+                        setSelectedPlan(plan)
+                        setSubmitError('')
+                      }
+                    }}
+                  >
+                    {data.pending_request ? 'Request Pending' : data.billing_configured ? 'Upgrade' : 'Upgrade unavailable'}
+                  </button>
+                )}
+              </article>
+            ))}
+          </div>
+
+          <div className="inline-callout">
+            <Icon name="info" size={16} />
+            Scan our official UPI QR Code to upgrade your plan. Once submitted with your payment screenshot and UTR, approval activates your plan automatically.
+          </div>
+          <p className="fine-print">
+            Calendar-month allowances reset at midnight India time. Failed and cancelled exchanges do not count. Active exchanges temporarily reserve capacity to prevent overbooking.
+          </p>
+
+          {/* Subscription Checkout Modal */}
+          {selectedPlan && data.qr_code && (
+            <div className="sub-modal-overlay" onClick={() => setSelectedPlan(null)}>
+              <div className="sub-modal-card" onClick={(e) => e.stopPropagation()}>
+                <div className="sub-modal-header">
+                  <h3>Upgrade to {selectedPlan.name} ({priceLabel(selectedPlan)})</h3>
+                  <button className="sub-modal-close" onClick={() => setSelectedPlan(null)}>&times;</button>
+                </div>
+
+                <form onSubmit={handleCheckoutSubmit}>
+                  <div className="sub-modal-body">
+                    {submitError && <p className="inline-error" role="alert">{submitError}</p>}
+
+                    <div className="sub-qr-preview-box">
+                      <span style={{ fontSize: '11px', fontWeight: 700, color: '#475569' }}>
+                        1. Scan QR with GPay / PhonePe / Paytm / BHIM
+                      </span>
+                      <img
+                        src="/api/subscriptions/qr-code"
+                        alt="ONPay Subscription QR Code"
+                        className="sub-qr-image"
+                      />
+                      <div className="sub-upi-copy-row">
+                        <code>{data.qr_code.upi_id}</code>
+                        <button
+                          type="button"
+                          className="btn-copy-upi"
+                          onClick={() => handleCopyUpi(data.qr_code.upi_id)}
+                        >
+                          {copied ? '✓ Copied' : 'Copy UPI ID'}
+                        </button>
+                      </div>
+                      <span style={{ fontSize: '11px', color: '#64748b' }}>
+                        Exact amount to pay: <strong>₹{selectedPlan.price_inr}</strong>
+                      </span>
+                    </div>
+
+                    <div className="sub-field-group">
+                      <label>2. UPI Transaction ID / 12-digit UTR</label>
+                      <input
+                        type="text"
+                        required
+                        placeholder="e.g. 412345678901"
+                        value={upiRef}
+                        onChange={(e) => setUpiRef(e.target.value)}
+                      />
+                    </div>
+
+                    <div className="sub-field-group">
+                      <label>3. Upload Payment Screenshot (PNG, JPG, WEBP, max 5MB)</label>
+                      <input
+                        type="file"
+                        required
+                        accept="image/png,image/jpeg,image/webp"
+                        className="sub-file-input"
+                        onChange={(e) => {
+                          if (e.target.files && e.target.files[0]) {
+                            setProofFile(e.target.files[0])
+                          }
+                        }}
+                      />
+                    </div>
+
+                    <button
+                      type="submit"
+                      className="button button-primary button-wide"
+                      disabled={submitting}
+                    >
+                      {submitting ? 'Submitting payment...' : 'Submit Payment for Verification'}
+                    </button>
+                    <small style={{ textAlign: 'center', color: '#64748b', fontSize: '10px' }}>
+                      Target review time is ~20 minutes. Entitlements activate immediately upon approval.
+                    </small>
+                  </div>
+                </form>
+              </div>
+            </div>
+          )}
+        </>
+      ) : !loadError ? (
+        <div className="loading-inline"><span className="spinner" />Loading plans…</div>
+      ) : (
+        <EmptyState title="Plans unavailable" body="Could not load plan information." />
+      )}
+    </div>
+  )
 }
 
 function PointsPage() {

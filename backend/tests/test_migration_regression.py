@@ -8,6 +8,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 os.environ.setdefault("APP_ENV", "development")
@@ -15,7 +16,7 @@ os.environ.setdefault("SECRET_KEY", "test-only-secret-key-with-more-than-32-char
 os.environ.setdefault("DATABASE_URL", "sqlite://")
 
 from app.database import Base
-from app.models import Subscription, User, now_utc
+from app.models import PaymentAttempt, Subscription, User, now_utc
 
 
 class MigrationRegressionTests(unittest.TestCase):
@@ -98,6 +99,11 @@ class MigrationRegressionTests(unittest.TestCase):
                     "expires_at": (now_utc() + timedelta(minutes=5)).isoformat(),
                     "last_sent_at": now_utc().isoformat(),
                 })
+
+            with Session(engine) as session:
+                with self.assertRaises(OperationalError) as legacy_schema_error:
+                    session.query(PaymentAttempt).first()
+                self.assertIn("receiver_confirmed_by", str(legacy_schema_error.exception))
             engine.dispose()
 
             child_env = os.environ.copy()
@@ -111,6 +117,11 @@ class MigrationRegressionTests(unittest.TestCase):
                 cwd=backend_dir, env=child_env, capture_output=True, text=True, timeout=60,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            with Session(engine) as session:
+                legacy_payment = session.get(PaymentAttempt, "migration-payment")
+                self.assertIsNotNone(legacy_payment)
+                self.assertIsNone(legacy_payment.receiver_confirmed_by)
+                self.assertIsNone(legacy_payment.receiver_confirmed_at)
 
             connection = sqlite3.connect(database_path)
             try:
@@ -138,7 +149,7 @@ class MigrationRegressionTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     connection.execute("SELECT version_num FROM alembic_version").fetchone()[0],
-                    "0003_receiver_confirmation_pro",
+                    "0005_v2_features",
                 )
             finally:
                 connection.close()

@@ -30,6 +30,14 @@ class ListingCreate(BaseModel):
     longitude: float | None = Field(default=None, ge=-180, le=180)
     availability: str = Field(min_length=2, max_length=120)
     note: str = Field(default="", max_length=500)
+    search_radius_km: int = Field(default=10)
+
+    @field_validator("search_radius_km")
+    @classmethod
+    def validate_radius(cls, value: int) -> int:
+        if value not in [1, 2, 5, 10, 25, 50]:
+            raise ValueError("search_radius_km must be one of [1, 2, 5, 10, 25, 50]")
+        return value
 
     @field_validator("location", "availability", "note")
     @classmethod
@@ -95,6 +103,17 @@ class BlockCreate(BaseModel):
 class ProfileUpdate(BaseModel):
     full_name: str = Field(min_length=2, max_length=100)
     college: str | None = Field(default=None, max_length=140)
+    upi_id: str | None = Field(default=None, min_length=3, max_length=100)
+
+
+class MatchRequestCreate(BaseModel):
+    provider_listing_id: str
+    amount: int = Field(gt=0, le=250_000)
+    note: str = Field(default="", max_length=500)
+
+
+class UpiIdUpdate(BaseModel):
+    upi_id: str = Field(min_length=3, max_length=100)
 
 
 class NotificationOut(BaseModel):

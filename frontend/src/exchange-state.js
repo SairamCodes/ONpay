@@ -1,4 +1,7 @@
 const DISPLAYED_EXCHANGE_FIELDS = [
+  'amount',
+  'location',
+  'meetup_at',
   'status',
   'payment_status',
   'requester_arrived',
@@ -11,6 +14,12 @@ const DISPLAYED_EXCHANGE_FIELDS = [
 export function exchangeSnapshotChanged(current, latest) {
   if (!current || !latest || current.id !== latest.id) return true
   return DISPLAYED_EXCHANGE_FIELDS.some((field) => current[field] !== latest[field])
+}
+
+export function isPaymentReadyExchange(exchange) {
+  return ['meetup_confirmed', 'payment_initiated', 'verification_pending'].includes(exchange?.status)
+    && exchange.requester_arrived
+    && exchange.provider_arrived
 }
 
 export async function refreshPaymentStatus(api, paymentId, currentStatus) {

@@ -30,3 +30,7 @@ dist/
 
 # Build artifacts
 *.tsbuildinfo
+
+# Local backups and uploads
+backend/backups/
+backend/uploads/

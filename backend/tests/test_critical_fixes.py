@@ -16,19 +16,21 @@ os.environ["DATABASE_URL"] = "sqlite://"
 os.environ["FRONTEND_ORIGINS"] = "https://onpay.example.test,https://preview.onpay.example.test"
 
 from fastapi import HTTPException, Response
+from fastapi.testclient import TestClient
 from starlette.datastructures import Headers
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 
 from app.config import Settings, settings
-from app.database import Base, SessionLocal, engine
+from app.database import Base, SessionLocal, engine, get_db
 from app.main import (
     app, check_quota, cors_options, create_listing, current_month_bounds, fastapi_app,
     get_listings, haversine_km, health, logger,
-    location_reverse, location_settings, logout, monthly_usage, request_otp, reverse_geocode, set_location, startup, subscriptions,
-    verify_otp,
+    location_reverse, location_settings, logout, monthly_usage, request_otp, reverse_geocode, set_location, startup,
+    subscriptions, transactions, verify_otp,
 )
-from app.models import Exchange, Listing, OTPChallenge, Subscription, User, now_utc
+from app.models import Exchange, Listing, OTPChallenge, PaymentAttempt, Subscription, User, now_utc
+from sqlalchemy.exc import SQLAlchemyError
 from app.security import create_session, current_user, hash_otp
 from app.schemas import ListingCreate, OTPRequest, OTPVerify
 
@@ -797,6 +799,57 @@ class CriticalFixTests(unittest.TestCase):
         self.db.add_all((request_listing, offer_listing))
         self.db.flush()
         self.db.add(exchange)
+
+    def test_transactions_filters_and_legacy_nullable_payment_fields(self):
+        statuses = (
+            "match_found", "awaiting_meetup", "meetup_confirmed", "payment_initiated",
+            "verification_pending", "success", "receiver_confirmed", "failed", "cancelled",
+        )
+        for suffix, exchange_status in enumerate(statuses):
+            self._exchange(suffix, exchange_status, now_utc() if exchange_status in ("success", "receiver_confirmed") else None)
+        self.db.add(PaymentAttempt(
+            id="legacy-payment", exchange_id="exchange-3", payer_id=self.requester.id,
+            payee_upi="aman.student@okaxis", amount=100, reference="ONLEGACY",
+            status="payment_initiated", provider="upi_deep_link",
+        ))
+        self.db.commit()
+
+        all_rows = transactions("all", 0, 30, self.requester, self.db)
+        completed = transactions("success", 0, 30, self.requester, self.db)
+        in_transit = transactions("in_transit", 0, 30, self.requester, self.db)
+        failed = transactions("failed", 0, 30, self.requester, self.db)
+
+        self.assertEqual(len(all_rows["transactions"]), len(statuses))
+        self.assertEqual({row["status"] for row in completed["transactions"]}, {"success", "receiver_confirmed"})
+        self.assertEqual(
+            {row["status"] for row in in_transit["transactions"]},
+            {"match_found", "awaiting_meetup", "meetup_confirmed", "payment_initiated", "verification_pending"},
+        )
+        self.assertEqual([row["status"] for row in failed["transactions"]], ["failed"])
+        pending = next(row for row in in_transit["transactions"] if row["id"] == "exchange-3")
+        self.assertEqual(pending["payment_status"], "payment_initiated")
+        payment = self.db.get(PaymentAttempt, "legacy-payment")
+        self.assertIsNone(payment.receiver_confirmed_by)
+        self.assertIsNone(payment.receiver_confirmed_at)
+
+    def test_transactions_requires_authentication(self):
+        fastapi_app.dependency_overrides[get_db] = lambda: self.db
+        try:
+            response = TestClient(fastapi_app).get("/api/transactions")
+        finally:
+            fastapi_app.dependency_overrides.pop(get_db, None)
+        self.assertEqual(response.status_code, 401)
+
+    def test_transaction_database_failure_is_logged_and_not_exposed(self):
+        self._exchange(0, "payment_initiated")
+        self.db.commit()
+        with patch("app.main.exchange_payload", side_effect=SQLAlchemyError("private schema detail")), \
+                self.assertLogs("onpay.auth", level="ERROR") as logs:
+            with self.assertRaises(HTTPException) as failure:
+                transactions("in_transit", 0, 30, self.requester, self.db)
+        self.assertEqual(failure.exception.status_code, 500)
+        self.assertNotIn("private schema detail", failure.exception.detail)
+        self.assertTrue(any(record.exc_info for record in logs.records))
 
     def test_calendar_month_usage_counts_only_completed_and_reserves_active_slots(self):
         now = now_utc()

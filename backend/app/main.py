@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import math
+import os
 import re
 import secrets
 import sys
@@ -15,29 +16,36 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from email.utils import parseaddr
+from pathlib import Path
 from uuid import uuid4
 
+import asyncio
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from sqlalchemy import and_, func, or_, update
 from sqlalchemy.orm import Session
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from .admin import router as admin_router
 from .config import settings
-from .database import Base, engine, get_db
+from .database import Base, SessionLocal, engine, get_db
+from .storage import storage_service
 from .models import (
-    Block, Conversation, Exchange, Friendship, Listing, LoginSession, Message, Notification,
-    OTPChallenge, PaymentAttempt, PointLedger, Report, StatusEvent, Subscription, User, now_utc,
+    AdminQRCode, Block, Conversation, Exchange, FriendRequest, Friendship, Listing, LoginSession, MatchRequest, Message, Notification,
+    OTPChallenge, PaymentAttempt, PointLedger, Report, StatusEvent, Subscription, SubscriptionRequest, User, UserLoginEvent, now_utc,
 )
 from .payment_adapter import YouPIMerchantAdapter, create_upi_intent
 from .schemas import (
     AcceptListing, ArrivalUpdate, BlockCreate, CashConfirmation, ListingCreate, ListingUpdate,
-    MessageCreate, OTPRequest, OTPVerify, PaymentCreate, ProfileUpdate, ReconciliationRequest, ReportCreate,
+    MatchRequestCreate, MessageCreate, OTPRequest, OTPVerify, PaymentCreate, ProfileUpdate,
+    ReconciliationRequest, ReportCreate, UpiIdUpdate,
 )
 from .security import COOKIE_NAME, create_session, current_user, hash_otp, hash_value, new_id, session_cookie_policy
 
 app = FastAPI(title="ONPay API", version="0.1.0", description="Student cash exchange coordination API")
+app.include_router(admin_router)
 
 
 def configure_app_logging() -> logging.Logger:
@@ -61,6 +69,25 @@ RESEND_EMAILS_URL = "https://api.resend.com/emails"
 BREVO_EMAILS_URL = "https://api.brevo.com/v3/smtp/email"
 MAILJET_EMAILS_URL = "https://api.mailjet.com/v3.1/send"
 EMAIL_REQUEST_TIMEOUT_SECONDS = 10.0
+UPLOAD_DIR = settings.get_uploads_dir() / "subscription_proofs"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def validate_image_bytes(data: bytes) -> str:
+    """Validate image magic bytes and size (max 5 MB). Returns mime type."""
+    if len(data) > 5 * 1024 * 1024:
+        raise HTTPException(400, "Image file size exceeds the 5 MB limit")
+    if len(data) < 12:
+        raise HTTPException(400, "Invalid image file")
+
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    elif data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    elif data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    else:
+        raise HTTPException(400, "Only JPEG, PNG, and WEBP image files are allowed")
 cors_origins = settings.get_cors_origins()
 cors_options = {
     "allow_origins": cors_origins,
@@ -70,9 +97,40 @@ cors_options = {
     "max_age": 600,
 }
 
+ws_connections: dict[str, set[WebSocket]] = {}
+_main_event_loop: asyncio.AbstractEventLoop | None = None
+
+
+async def broadcast_to_user(user_id: str, event: dict) -> None:
+    sockets = ws_connections.get(user_id, set()).copy()
+    for ws in sockets:
+        try:
+            await ws.send_json(event)
+        except Exception:
+            ws_connections.get(user_id, set()).discard(ws)
+
+
+def sync_broadcast_to_user(user_id: str, event: dict) -> None:
+    try:
+        loop = None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            global _main_event_loop
+            loop = _main_event_loop
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(broadcast_to_user(user_id, event), loop)
+    except Exception:
+        pass
+
 
 @app.on_event("startup")
 def startup() -> None:
+    global _main_event_loop
+    try:
+        _main_event_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        pass
     if settings.app_env != "development" and settings.dev_otp_mode:
         raise RuntimeError("DEV_OTP_MODE must be false unless APP_ENV=development")
     if settings.app_env != "development" and (settings.secret_key == "development-only-change-me" or len(settings.secret_key) < 32):
@@ -138,8 +196,16 @@ def send_sms_verify(contact: str, action: str) -> str:
 
 
 def email_delivery_configuration_error() -> str | None:
-    if settings.email_provider not in ("mailjet", "resend", "brevo"):
+    if settings.email_provider not in ("mailjet", "resend", "brevo", "smtp"):
         return "The configured email provider is not supported"
+    if settings.email_provider == "smtp":
+        if settings.app_env != "development":
+            return "The configured email provider is not supported"
+        if not settings.smtp_host.strip():
+            return "Email OTP delivery requires an SMTP host"
+        if not (settings.smtp_from.strip() or settings.email_from.strip() or settings.smtp_username.strip()):
+            return "Email OTP delivery requires a valid sender address"
+        return None
     if settings.email_provider == "mailjet":
         if not settings.mailjet_api_key.strip() or not settings.mailjet_secret_key.strip():
             return "Email OTP delivery requires Mailjet API credentials"
@@ -287,7 +353,32 @@ def deliver_otp(channel: str, contact: str, code: str, challenge_id: str | None 
     )
     subject = "Your ONPay sign-in code"
     text_content = f"Your ONPay verification code is {code}. It expires in {settings.otp_ttl_minutes} minutes."
-    if settings.email_provider == "mailjet":
+    if settings.email_provider == "smtp":
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.mime.multipart import MIMEMultipart
+        sender_email = settings.smtp_from or settings.email_from or settings.smtp_username
+        msg = MIMEMultipart()
+        msg["From"] = sender_email
+        msg["To"] = contact
+        msg["Subject"] = subject
+        msg.attach(MIMEText(text_content, "plain"))
+        logger.info(
+            "OTP email request started challenge_id=%s provider=smtp host=%s attempted=true",
+            challenge_id, settings.smtp_host,
+        )
+        try:
+            with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=EMAIL_REQUEST_TIMEOUT_SECONDS) as server:
+                if settings.smtp_starttls:
+                    server.starttls()
+                if settings.smtp_username and settings.smtp_password:
+                    server.login(settings.smtp_username, settings.smtp_password)
+                server.send_message(msg)
+            return f"smtp-{uuid4().hex[:16]}"
+        except Exception as exc:
+            logger.exception("Failed to send OTP email via SMTP: %s", exc)
+            raise HTTPException(502, "Could not deliver verification email via SMTP") from exc
+    elif settings.email_provider == "mailjet":
         sender_name, sender_address = parseaddr(settings.email_from)
         sender = {"Email": sender_address}
         if sender_name:
@@ -526,16 +617,18 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 def plan_catalog() -> tuple[dict, ...]:
     return (
         {"id": "free", "name": "Free", "price_inr": 0, "period": "month", "limit": 5},
-        {"id": "plus", "name": "Plus", "price_inr": 199, "period": "month", "limit": 20},
+        {"id": "membership", "name": "Membership", "price_inr": 199, "period": "month", "limit": 20},
+        {"id": "plus", "name": "Membership", "price_inr": 199, "period": "month", "limit": 20},
         {"id": "pro", "name": "Pro", "price_inr": settings.pro_plan_price_inr,
          "period": settings.pro_plan_billing_period.strip() or None, "limit": None},
     )
 
 
 IN_PROGRESS_EXCHANGE_STATES = (
+    "MATCH_ACCEPTED", "CASH_HANDOVER_PENDING", "CASH_HANDED_OVER", "PAYMENT_INITIATED", "PAYMENT_PENDING", "PAYMENT_VERIFIED", "DISPUTED",
     "match_found", "awaiting_meetup", "meetup_confirmed", "payment_initiated", "verification_pending", "disputed",
 )
-COMPLETED_EXCHANGE_STATES = ("success", "receiver_confirmed")
+COMPLETED_EXCHANGE_STATES = ("COMPLETED", "success", "receiver_confirmed")
 
 
 def current_month_bounds(now: datetime | None = None) -> tuple[datetime, datetime]:
@@ -558,7 +651,7 @@ def effective_plan(db: Session, user: User) -> str:
     now = now_utc()
     subscriptions = db.query(Subscription).filter(
         Subscription.user_id == user.id,
-        Subscription.plan.in_(("plus", "pro", "premium")),
+        Subscription.plan.in_(("membership", "plus", "pro", "premium")),
         Subscription.status == "active",
     ).order_by(Subscription.starts_at.desc()).all()
     valid = []
@@ -571,7 +664,12 @@ def effective_plan(db: Session, user: User) -> str:
     plan = "free"
     if valid:
         latest = valid[0]
-        plan = "pro" if latest.plan in ("pro", "premium") else "plus"
+        if latest.plan in ("pro", "premium"):
+            plan = "pro"
+        elif latest.plan == "plus":
+            plan = "plus"
+        else:
+            plan = "membership"
     if user.plan != plan:
         user.plan = plan
     return plan
@@ -602,15 +700,74 @@ def user_payload(user: User, db: Session) -> dict:
         "college": user.college, "location_label": user.location_label, "verified_email": user.verified_email,
         "verified_phone": user.verified_phone, "plan": effective_plan(db, user), "points": int(points),
         "completed_exchanges": completed, "friends_count": friends,
+        "upi_id": user.upi_id,
     }
 
 
 def notify(db: Session, user_id: str, title: str, body: str, kind: str = "info") -> None:
-    db.add(Notification(id=new_id(), user_id=user_id, title=title, body=body, kind=kind))
+    now = now_utc()
+    item = Notification(id=new_id(), user_id=user_id, title=title, body=body, kind=kind, created_at=now)
+    db.add(item)
+    sync_broadcast_to_user(user_id, {
+        "type": "notification",
+        "notification": {
+            "id": item.id, "title": item.title, "body": item.body, "kind": item.kind,
+            "read_at": None, "created_at": now.isoformat(),
+        }
+    })
 
 
 def create_status_event(db: Session, exchange_id: str, status_name: str, actor_id: str | None, details: str = "") -> None:
     db.add(StatusEvent(id=new_id(), exchange_id=exchange_id, status=status_name, actor_id=actor_id, details=details))
+
+
+def award_completion_points(db: Session, exchange: Exchange) -> int:
+    """Award points exactly once to each participant of a completed exchange.
+
+    Guarantees idempotency via queries and database integrity constraints.
+    Returns the number of point awards created (0 if already awarded).
+    """
+    if exchange.status not in COMPLETED_EXCHANGE_STATES:
+        return 0
+
+    points_to_award = settings.completion_points_award
+    if points_to_award <= 0:
+        return 0
+
+    awards_count = 0
+    participants = (exchange.requester_id, exchange.provider_id)
+
+    for participant_id in participants:
+        existing = db.query(PointLedger).filter(
+            PointLedger.user_id == participant_id,
+            PointLedger.exchange_id == exchange.id,
+        ).first()
+
+        if not existing:
+            try:
+                with db.begin_nested():
+                    entry = PointLedger(
+                        id=new_id(),
+                        user_id=participant_id,
+                        exchange_id=exchange.id,
+                        amount=points_to_award,
+                        reason="completed_exchange",
+                        created_at=now_utc(),
+                    )
+                    db.add(entry)
+                    db.flush()
+                awards_count += 1
+                notify(
+                    db,
+                    participant_id,
+                    "Reward points earned!",
+                    f"You earned {points_to_award} points for completing your exchange.",
+                    "points",
+                )
+            except IntegrityError:
+                pass
+
+    return awards_count
 
 
 def get_exchange_for_user(db: Session, exchange_id: str, user_id: str) -> Exchange:
@@ -620,12 +777,22 @@ def get_exchange_for_user(db: Session, exchange_id: str, user_id: str) -> Exchan
     return exchange
 
 
+def existing_exchange_for_listing(db: Session, listing_id: str, user_id: str) -> Exchange | None:
+    return db.query(Exchange).filter(
+        or_(Exchange.listing_id == listing_id, Exchange.matched_listing_id == listing_id),
+        or_(Exchange.requester_id == user_id, Exchange.provider_id == user_id),
+    ).order_by(Exchange.created_at.desc()).first()
+
+
 def begin_quota_serialization(db: Session) -> None:
     """Serialize quota reservations on SQLite, where SELECT FOR UPDATE is ignored."""
     if db.get_bind().dialect.name == "sqlite":
         # Acquire SQLite's writer reservation before reading usage. Other SQLite
         # transactions wait here instead of both observing the same free slot.
-        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        except Exception:
+            pass
 
 
 def exchange_payload(db: Session, exchange: Exchange, user_id: str) -> dict:
@@ -642,6 +809,13 @@ def exchange_payload(db: Session, exchange: Exchange, user_id: str) -> dict:
         "requester_arrived": exchange.requester_arrived, "provider_arrived": exchange.provider_arrived,
         "requester_cash_confirmed": exchange.requester_cash_confirmed,
         "provider_cash_confirmed": exchange.provider_cash_confirmed,
+        "seeker_cash_received": getattr(exchange, "seeker_cash_received", False),
+        "seeker_cash_received_at": exchange.seeker_cash_received_at.isoformat() if getattr(exchange, "seeker_cash_received_at", None) else None,
+        "provider_upi_received": getattr(exchange, "provider_upi_received", False),
+        "provider_upi_received_at": exchange.provider_upi_received_at.isoformat() if getattr(exchange, "provider_upi_received_at", None) else None,
+        "cancelled_at": exchange.cancelled_at.isoformat() if getattr(exchange, "cancelled_at", None) else None,
+        "dispute_reason": getattr(exchange, "dispute_reason", None),
+        "completed_at": exchange.completed_at.isoformat() if exchange.completed_at else None,
         "other_user": {"id": other.id, "full_name": other.full_name, "college": other.college} if other else None,
         "created_at": exchange.created_at.isoformat(),
     }
@@ -746,7 +920,7 @@ def request_otp(payload: OTPRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/api/auth/otp/verify")
-def verify_otp(payload: OTPVerify, response: Response, db: Session = Depends(get_db)):
+def verify_otp(payload: OTPVerify, response: Response, db: Session = Depends(get_db), request: Request = None):
     challenge = db.get(OTPChallenge, payload.challenge_id)
     if not challenge or challenge.consumed_at or challenge.expires_at < now_utc():
         raise HTTPException(400, "This verification code has expired. Request a new one.")
@@ -762,12 +936,12 @@ def verify_otp(payload: OTPVerify, response: Response, db: Session = Depends(get
             raise HTTPException(503, "Mobile OTP delivery is not configured")
         endpoint = f"https://verify.twilio.com/v2/Services/{sid}/VerificationCheck"
         body = urllib.parse.urlencode({"To": challenge.contact, "Code": payload.code}).encode()
-        request = urllib.request.Request(endpoint, data=body, method="POST")
+        request_obj = urllib.request.Request(endpoint, data=body, method="POST")
         auth = base64.b64encode(f"{settings.twilio_account_sid}:{settings.twilio_auth_token}".encode()).decode()
-        request.add_header("Authorization", f"Basic {auth}")
-        request.add_header("Content-Type", "application/x-www-form-urlencoded")
+        request_obj.add_header("Authorization", f"Basic {auth}")
+        request_obj.add_header("Content-Type", "application/x-www-form-urlencoded")
         try:
-            with urllib.request.urlopen(request, timeout=8) as result:
+            with urllib.request.urlopen(request_obj, timeout=8) as result:
                 verified = json.loads(result.read().decode()).get("status") == "approved"
         except urllib.error.HTTPError as exc:
             if exc.code == 400:
@@ -802,7 +976,18 @@ def verify_otp(payload: OTPVerify, response: Response, db: Session = Depends(get
         db.add(Subscription(id=new_id(), user_id=user.id, plan="free", status="active", starts_at=now_utc()))
     elif not user:
         raise HTTPException(404, "No account was found for that contact")
-    challenge.consumed_at = now_utc()
+    now = now_utc()
+    challenge.consumed_at = now
+    user.last_login_at = now
+    login_ip = request.client.host if request and request.client else None
+    login_ua = request.headers.get("user-agent") if request else None
+    db.add(UserLoginEvent(
+        id=new_id(),
+        user_id=user.id,
+        login_at=now,
+        ip_address=login_ip,
+        user_agent=login_ua,
+    ))
     db.commit()
     create_session(response, db, user)
     return {"user": user_payload(user, db)}
@@ -830,8 +1015,25 @@ def logout(request: Request, response: Response, db: Session = Depends(get_db)):
 def update_profile(payload: ProfileUpdate, user: User = Depends(current_user), db: Session = Depends(get_db)):
     user.full_name = payload.full_name.strip()
     user.college = (payload.college or "").strip() or None
+    if payload.upi_id is not None:
+        user.upi_id = payload.upi_id.strip() or None
     db.commit()
     return {"user": user_payload(user, db)}
+
+
+@app.get("/api/profile/upi-qr")
+def get_upi_qr(user: User = Depends(current_user)):
+    if not user.upi_id:
+        raise HTTPException(404, "User does not have a UPI ID configured")
+    query = urllib.parse.urlencode({
+        "pa": user.upi_id.strip(),
+        "pn": user.full_name.strip()[:80],
+        "cu": "INR",
+    })
+    return {
+        "upi_id": user.upi_id.strip(),
+        "upi_uri": f"upi://pay?{query}",
+    }
 
 
 @app.post("/api/listings")
@@ -850,6 +1052,7 @@ def create_listing(payload: ListingCreate, user: User = Depends(current_user), d
         latitude=round(payload.latitude, 3) if payload.latitude is not None else None,
         longitude=round(payload.longitude, 3) if payload.longitude is not None else None,
         location=payload.location, availability=payload.availability, note=payload.note,
+        search_radius_km=payload.search_radius_km,
     )
     db.add(listing)
     db.commit()
@@ -861,7 +1064,9 @@ def listing_payload(db: Session, listing: Listing, viewer_id: str, distance_km: 
     return {
         "id": listing.id, "kind": listing.kind, "amount_min": listing.amount_min,
         "amount_max": listing.amount_max, "location": listing.location,
-        "availability": listing.availability, "note": listing.note, "status": listing.status,
+        "availability": listing.availability, "note": listing.note,
+        "search_radius_km": getattr(listing, "search_radius_km", 10),
+        "status": listing.status,
         "created_at": listing.created_at.isoformat(),
         "distance_km": round(distance_km, 1) if distance_km is not None else None,
         "owner": {"id": owner.id, "full_name": owner.full_name, "college": owner.college,
@@ -909,7 +1114,8 @@ def get_listings(
             if listing.latitude is None or listing.longitude is None:
                 continue
             distance = haversine_km(latitude, longitude, listing.latitude, listing.longitude)
-            if distance <= radius_km:
+            effective_radius = min(radius_km, float(getattr(listing, "search_radius_km", 10) or 10))
+            if distance <= effective_radius:
                 results.append(listing)
                 distances[listing.id] = distance
     else:
@@ -942,6 +1148,9 @@ def update_listing(listing_id: str, payload: ListingUpdate, user: User = Depends
 @app.post("/api/listings/{listing_id}/accept")
 def accept_listing(listing_id: str, payload: AcceptListing, user: User = Depends(current_user), db: Session = Depends(get_db)):
     begin_quota_serialization(db)
+    existing_exchange = existing_exchange_for_listing(db, listing_id, user.id)
+    if existing_exchange:
+        return {"exchange": exchange_payload(db, existing_exchange, user.id), "duplicate": True}
     target = db.query(Listing).filter_by(id=listing_id).with_for_update().first()
     if not target or target.status != "active" or target.owner_id == user.id:
         raise HTTPException(404, "This listing is no longer available")
@@ -976,8 +1185,258 @@ def accept_listing(listing_id: str, payload: AcceptListing, user: User = Depends
         db.commit()
     except IntegrityError as exc:
         db.rollback()
+        existing_exchange = existing_exchange_for_listing(db, listing_id, user.id)
+        if existing_exchange:
+            return {"exchange": exchange_payload(db, existing_exchange, user.id), "duplicate": True}
         raise HTTPException(409, "This listing was matched by another student just now") from exc
-    return {"exchange": exchange_payload(db, exchange, user.id)}
+    return {"exchange": exchange_payload(db, exchange, user.id), "duplicate": False}
+
+
+def match_request_payload(db: Session, request: MatchRequest, current_user_id: str) -> dict:
+    seeker = db.get(User, request.seeker_id)
+    provider = db.get(User, request.provider_id)
+    seeker_listing = db.get(Listing, request.seeker_listing_id)
+    provider_listing = db.get(Listing, request.provider_listing_id)
+    return {
+        "id": request.id,
+        "seeker_id": request.seeker_id,
+        "provider_id": request.provider_id,
+        "seeker_listing_id": request.seeker_listing_id,
+        "provider_listing_id": request.provider_listing_id,
+        "seeker_name": seeker.full_name if seeker else "Student",
+        "provider_name": provider.full_name if provider else "Student",
+        "amount": request.amount,
+        "note": request.note or "",
+        "status": request.status,
+        "created_at": request.created_at.isoformat(),
+        "responded_at": request.responded_at.isoformat() if request.responded_at else None,
+        "expires_at": request.expires_at.isoformat(),
+        "is_outgoing": request.seeker_id == current_user_id,
+        "seeker_listing": listing_payload(db, seeker_listing, current_user_id) if seeker_listing else None,
+        "provider_listing": listing_payload(db, provider_listing, current_user_id) if provider_listing else None,
+    }
+
+
+@app.post("/api/match-requests")
+def create_match_request(payload: MatchRequestCreate, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    provider_listing = db.get(Listing, payload.provider_listing_id)
+    if not provider_listing or provider_listing.status != "active" or provider_listing.kind != "have":
+        raise HTTPException(404, "Active cash offer not found")
+    if provider_listing.owner_id == user.id:
+        raise HTTPException(400, "You cannot match with your own cash offer")
+
+    if db.query(Block).filter(
+        or_(
+            and_(Block.blocker_id == user.id, Block.blocked_id == provider_listing.owner_id),
+            and_(Block.blocker_id == provider_listing.owner_id, Block.blocked_id == user.id)
+        )
+    ).first():
+        raise HTTPException(403, "Match request is unavailable for this student")
+
+    seeker_listing = db.query(Listing).filter_by(owner_id=user.id, kind="need", status="active").first()
+    if not seeker_listing:
+        raise HTTPException(400, "You need an active cash request before sending a match request")
+
+    if not (provider_listing.amount_min <= payload.amount <= provider_listing.amount_max):
+        raise HTTPException(400, f"Amount must be between ₹{provider_listing.amount_min} and ₹{provider_listing.amount_max}")
+    if not (seeker_listing.amount_min <= payload.amount <= seeker_listing.amount_max):
+        raise HTTPException(400, "Amount does not match your active cash request")
+
+    check_quota(db, user)
+    provider_user = db.get(User, provider_listing.owner_id)
+    if provider_user:
+        check_quota(db, provider_user)
+
+    existing = db.query(MatchRequest).filter_by(
+        seeker_id=user.id,
+        provider_listing_id=provider_listing.id,
+        status="pending",
+    ).first()
+    if existing:
+        if existing.expires_at > now_utc():
+            return {"match_request": match_request_payload(db, existing, user.id), "duplicate": True}
+        else:
+            existing.status = "expired"
+            db.commit()
+
+    now = now_utc()
+    expires = now + timedelta(minutes=settings.match_request_ttl_minutes)
+    req = MatchRequest(
+        id=new_id(),
+        seeker_id=user.id,
+        provider_id=provider_listing.owner_id,
+        seeker_listing_id=seeker_listing.id,
+        provider_listing_id=provider_listing.id,
+        amount=payload.amount,
+        note=payload.note,
+        status="pending",
+        created_at=now,
+        expires_at=expires,
+    )
+    db.add(req)
+    db.commit()
+
+    notify(db, provider_listing.owner_id, "New cash match request", f"{user.full_name} wants to exchange ₹{payload.amount} with you.", "match_request")
+    sync_broadcast_to_user(provider_listing.owner_id, {
+        "type": "match_request",
+        "match_request": match_request_payload(db, req, provider_listing.owner_id),
+    })
+
+    return {"match_request": match_request_payload(db, req, user.id), "duplicate": False}
+
+
+@app.get("/api/match-requests")
+def list_match_requests(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    now = now_utc()
+    pending = db.query(MatchRequest).filter(
+        or_(MatchRequest.seeker_id == user.id, MatchRequest.provider_id == user.id),
+        MatchRequest.status == "pending",
+        MatchRequest.expires_at <= now,
+    ).all()
+    for p in pending:
+        p.status = "expired"
+    if pending:
+        db.commit()
+
+    requests = db.query(MatchRequest).filter(
+        or_(MatchRequest.seeker_id == user.id, MatchRequest.provider_id == user.id),
+    ).order_by(MatchRequest.created_at.desc()).limit(50).all()
+
+    incoming = [match_request_payload(db, r, user.id) for r in requests if r.provider_id == user.id]
+    outgoing = [match_request_payload(db, r, user.id) for r in requests if r.seeker_id == user.id]
+    return {
+        "match_requests": [match_request_payload(db, r, user.id) for r in requests],
+        "incoming": incoming,
+        "outgoing": outgoing,
+    }
+
+
+@app.get("/api/match-requests/{match_request_id}")
+def get_match_request(match_request_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    req = db.get(MatchRequest, match_request_id)
+    if not req or user.id not in (req.seeker_id, req.provider_id):
+        raise HTTPException(404, "Match request not found")
+    if req.status == "pending" and req.expires_at <= now_utc():
+        req.status = "expired"
+        db.commit()
+    return {"match_request": match_request_payload(db, req, user.id)}
+
+
+@app.patch("/api/match-requests/{match_request_id}/accept")
+def accept_match_request(match_request_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    begin_quota_serialization(db)
+    req = db.get(MatchRequest, match_request_id)
+    if not req or req.provider_id != user.id:
+        raise HTTPException(404, "Match request not found")
+    if req.status != "pending" or req.expires_at <= now_utc():
+        if req.status == "pending":
+            req.status = "expired"
+            db.commit()
+        raise HTTPException(409, f"Match request is {req.status}")
+
+    seeker_listing = db.get(Listing, req.seeker_listing_id)
+    provider_listing = db.get(Listing, req.provider_listing_id)
+    if not seeker_listing or not provider_listing:
+        raise HTTPException(404, "Listing not found")
+    if seeker_listing.status != "active" or provider_listing.status != "active":
+        raise HTTPException(409, "One of the listings is no longer active")
+
+    seeker = db.get(User, req.seeker_id)
+    check_quota(db, seeker)
+    check_quota(db, user)
+
+    now = now_utc()
+    req.status = "accepted"
+    req.responded_at = now
+
+    seeker_listing.status = "matched"
+    provider_listing.status = "matched"
+
+    meetup_at = provider_listing.availability if len(provider_listing.availability) >= len(seeker_listing.availability) else seeker_listing.availability
+    exchange = Exchange(
+        id=new_id(),
+        listing_id=seeker_listing.id,
+        matched_listing_id=provider_listing.id,
+        requester_id=seeker.id,
+        provider_id=user.id,
+        amount=req.amount,
+        location=provider_listing.location or seeker_listing.location,
+        meetup_at=meetup_at,
+        status="MATCH_ACCEPTED",
+        created_at=now,
+    )
+    db.add(exchange)
+
+    a, b = sorted((seeker.id, user.id))
+    conv = db.query(Conversation).filter_by(participant_a=a, participant_b=b, exchange_id=exchange.id).first()
+    if not conv:
+        conv = Conversation(id=new_id(), participant_a=a, participant_b=b, exchange_id=exchange.id, updated_at=now)
+        db.add(conv)
+
+    other_requests = db.query(MatchRequest).filter(
+        MatchRequest.id != req.id,
+        MatchRequest.status == "pending",
+        or_(
+            MatchRequest.seeker_listing_id == seeker_listing.id,
+            MatchRequest.provider_listing_id == provider_listing.id,
+        )
+    ).all()
+    for other in other_requests:
+        other.status = "rejected"
+        other.responded_at = now
+        notify(db, other.seeker_id, "Match request unavailable", "The listing was matched with another student.", "match_request")
+
+    create_status_event(db, exchange.id, "MATCH_ACCEPTED", user.id, f"Match request accepted for ₹{req.amount}")
+    notify(db, seeker.id, "Match accepted!", f"{user.full_name} accepted your match request for ₹{req.amount}.", "match_accepted")
+
+    db.commit()
+
+    sync_broadcast_to_user(seeker.id, {
+        "type": "match_request_accepted",
+        "exchange": exchange_payload(db, exchange, seeker.id),
+    })
+
+    return {
+        "match_request": match_request_payload(db, req, user.id),
+        "exchange": exchange_payload(db, exchange, user.id),
+    }
+
+
+@app.patch("/api/match-requests/{match_request_id}/reject")
+def reject_match_request(match_request_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    req = db.get(MatchRequest, match_request_id)
+    if not req or req.provider_id != user.id:
+        raise HTTPException(404, "Match request not found")
+    if req.status != "pending":
+        raise HTTPException(409, f"Match request is {req.status}")
+
+    now = now_utc()
+    req.status = "rejected"
+    req.responded_at = now
+    db.commit()
+
+    notify(db, req.seeker_id, "Match request declined", f"{user.full_name} declined your match request.", "match_request")
+    sync_broadcast_to_user(req.seeker_id, {
+        "type": "match_request_rejected",
+        "match_request": match_request_payload(db, req, req.seeker_id),
+    })
+
+    return {"match_request": match_request_payload(db, req, user.id)}
+
+
+@app.post("/api/match-requests/{match_request_id}/cancel")
+def cancel_match_request(match_request_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    req = db.get(MatchRequest, match_request_id)
+    if not req or req.seeker_id != user.id:
+        raise HTTPException(404, "Match request not found")
+    if req.status != "pending":
+        raise HTTPException(409, f"Cannot cancel match request with status {req.status}")
+
+    req.status = "cancelled"
+    req.responded_at = now_utc()
+    db.commit()
+
+    return {"match_request": match_request_payload(db, req, user.id)}
 
 
 @app.get("/api/exchanges")
@@ -1011,7 +1470,7 @@ def update_arrival(exchange_id: str, payload: ArrivalUpdate, user: User = Depend
         exchange.requester_arrived = payload.arrived
     else:
         exchange.provider_arrived = payload.arrived
-    if exchange.requester_arrived and exchange.provider_arrived and exchange.status == "awaiting_meetup":
+    if exchange.requester_arrived and exchange.provider_arrived and exchange.status in ("awaiting_meetup", "MATCH_ACCEPTED"):
         exchange.status = "meetup_confirmed"
         create_status_event(db, exchange.id, "meetup_confirmed", user.id, "Both participants confirmed arrival")
         notify(db, exchange.requester_id, "Meetup confirmed", "Both students confirmed they arrived.", "meetup")
@@ -1050,10 +1509,93 @@ def confirm_cash(exchange_id: str, payload: CashConfirmation, user: User = Depen
     return {"exchange": exchange_payload(db, exchange, user.id), "message": "Cash handover recorded; payment status is tracked separately."}
 
 
+@app.post("/api/exchanges/{exchange_id}/confirm-cash-received")
+def confirm_cash_received(exchange_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    exchange = get_exchange_for_user(db, exchange_id, user.id)
+    if user.id != exchange.requester_id:
+        raise HTTPException(403, "Only the cash seeker can confirm receiving physical cash")
+    if exchange.status in ("CANCELLED", "cancelled", "EXPIRED", "expired", "DISPUTED", "disputed"):
+        raise HTTPException(409, f"Cannot confirm cash in state {exchange.status}")
+
+    now = now_utc()
+    if not exchange.seeker_cash_received:
+        exchange.seeker_cash_received = True
+        exchange.seeker_cash_received_at = now
+        exchange.requester_cash_confirmed = True
+
+        create_status_event(db, exchange.id, "CASH_SEEKER_CONFIRMED", user.id, "Cash seeker confirmed receipt of physical cash")
+        notify(db, exchange.provider_id, "Cash receipt confirmed", f"{user.full_name} confirmed receiving physical cash.", "cash_confirmed")
+
+    # Check dual completion rule
+    if exchange.seeker_cash_received and exchange.provider_upi_received:
+        exchange.status = "COMPLETED"
+        if not exchange.completed_at:
+            exchange.completed_at = now
+        create_status_event(db, exchange.id, "COMPLETED", user.id, "Both parties confirmed: exchange COMPLETED")
+        notify(db, exchange.requester_id, "Transaction completed", "Physical cash and UPI payment are both confirmed!", "exchange_completed")
+        notify(db, exchange.provider_id, "Transaction completed", "Physical cash and UPI payment are both confirmed!", "exchange_completed")
+        award_completion_points(db, exchange)
+    elif exchange.status in ("MATCH_ACCEPTED", "CASH_HANDOVER_PENDING", "awaiting_meetup", "meetup_confirmed"):
+        exchange.status = "CASH_HANDED_OVER"
+
+    db.commit()
+
+    sync_broadcast_to_user(exchange.provider_id, {
+        "type": "exchange_update",
+        "exchange": exchange_payload(db, exchange, exchange.provider_id),
+    })
+
+    return {"exchange": exchange_payload(db, exchange, user.id)}
+
+
+@app.post("/api/exchanges/{exchange_id}/confirm-upi-received")
+def confirm_upi_received(exchange_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    exchange = get_exchange_for_user(db, exchange_id, user.id)
+    if user.id != exchange.provider_id:
+        raise HTTPException(403, "Only the cash provider can confirm receiving UPI payment")
+    if exchange.status in ("CANCELLED", "cancelled", "EXPIRED", "expired", "DISPUTED", "disputed"):
+        raise HTTPException(409, f"Cannot confirm UPI in state {exchange.status}")
+
+    now = now_utc()
+    if not exchange.provider_upi_received:
+        exchange.provider_upi_received = True
+        exchange.provider_upi_received_at = now
+
+        latest_payment = db.query(PaymentAttempt).filter_by(exchange_id=exchange.id).order_by(PaymentAttempt.created_at.desc()).first()
+        if latest_payment:
+            latest_payment.status = "receiver_confirmed"
+            latest_payment.receiver_confirmed_by = user.id
+            latest_payment.receiver_confirmed_at = now
+
+        create_status_event(db, exchange.id, "CASH_PROVIDER_CONFIRMED", user.id, "Cash provider confirmed receipt of UPI payment")
+        notify(db, exchange.requester_id, "UPI payment confirmed", f"{user.full_name} confirmed receiving the UPI payment.", "upi_confirmed")
+
+    # Check dual completion rule
+    if exchange.seeker_cash_received and exchange.provider_upi_received:
+        exchange.status = "COMPLETED"
+        if not exchange.completed_at:
+            exchange.completed_at = now
+        create_status_event(db, exchange.id, "COMPLETED", user.id, "Both parties confirmed: exchange COMPLETED")
+        notify(db, exchange.requester_id, "Transaction completed", "Physical cash and UPI payment are both confirmed!", "exchange_completed")
+        notify(db, exchange.provider_id, "Transaction completed", "Physical cash and UPI payment are both confirmed!", "exchange_completed")
+        award_completion_points(db, exchange)
+    elif exchange.status in ("payment_initiated", "PAYMENT_INITIATED", "verification_pending", "PAYMENT_PENDING"):
+        exchange.status = "PAYMENT_VERIFIED"
+
+    db.commit()
+
+    sync_broadcast_to_user(exchange.requester_id, {
+        "type": "exchange_update",
+        "exchange": exchange_payload(db, exchange, exchange.requester_id),
+    })
+
+    return {"exchange": exchange_payload(db, exchange, user.id)}
+
+
 @app.post("/api/exchanges/{exchange_id}/cancel")
 def cancel_exchange(exchange_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     exchange = get_exchange_for_user(db, exchange_id, user.id)
-    if exchange.status not in ("awaiting_meetup", "meetup_confirmed"):
+    if exchange.status not in ("awaiting_meetup", "MATCH_ACCEPTED", "meetup_confirmed"):
         raise HTTPException(409, "An exchange with a payment attempt cannot be cancelled here. Use the dispute flow.")
     exchange.status = "cancelled"
     for listing_id in (exchange.listing_id, exchange.matched_listing_id):
@@ -1234,19 +1776,23 @@ def transactions(
     allowed = {"all", "success", "in_transit", "failed", "cancelled", "disputed"}
     if status_filter not in allowed:
         raise HTTPException(400, "Invalid transaction filter")
-    query = db.query(Exchange).filter(or_(Exchange.requester_id == user.id, Exchange.provider_id == user.id))
-    status_map = {"in_transit": ("match_found", "awaiting_meetup", "meetup_confirmed", "payment_initiated", "verification_pending")}
-    if status_filter == "in_transit":
-        query = query.filter(Exchange.status.in_(status_map[status_filter]))
-    elif status_filter == "success":
-        query = query.filter(Exchange.status.in_(COMPLETED_EXCHANGE_STATES))
-    elif status_filter != "all":
-        query = query.filter(Exchange.status == status_filter)
-    rows = query.order_by(Exchange.created_at.desc()).offset(offset).limit(limit + 1).all()
-    has_more = len(rows) > limit
-    page = rows[:limit]
-    return {"transactions": [exchange_payload(db, item, user.id) for item in page],
-            "has_more": has_more, "next_offset": offset + len(page)}
+    try:
+        query = db.query(Exchange).filter(or_(Exchange.requester_id == user.id, Exchange.provider_id == user.id))
+        status_map = {"in_transit": ("match_found", "awaiting_meetup", "meetup_confirmed", "payment_initiated", "verification_pending")}
+        if status_filter == "in_transit":
+            query = query.filter(Exchange.status.in_(status_map[status_filter]))
+        elif status_filter == "success":
+            query = query.filter(Exchange.status.in_(COMPLETED_EXCHANGE_STATES))
+        elif status_filter != "all":
+            query = query.filter(Exchange.status == status_filter)
+        rows = query.order_by(Exchange.created_at.desc()).offset(offset).limit(limit + 1).all()
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        return {"transactions": [exchange_payload(db, item, user.id) for item in page],
+                "has_more": has_more, "next_offset": offset + len(page)}
+    except SQLAlchemyError as exc:
+        logger.exception("Could not load transactions status_filter=%s user_id=%s", status_filter, user.id)
+        raise HTTPException(500, "Transactions could not be loaded. Please try again later.") from exc
 
 
 @app.get("/api/chats")
@@ -1279,13 +1825,15 @@ def send_message(other_user_id: str, payload: MessageCreate, exchange_id: str | 
         conversation = Conversation(id=new_id(), participant_a=a, participant_b=b, exchange_id=exchange_id)
         db.add(conversation)
         db.flush()
-    message = Message(id=new_id(), conversation_id=conversation.id, sender_id=user.id, body=payload.body)
+    message = Message(id=new_id(), conversation_id=conversation.id, sender_id=user.id, body=payload.body, created_at=now_utc())
     conversation.updated_at = now_utc()
     db.add(message)
     notify(db, other_user_id, "New message", f"{user.full_name}: {payload.body[:80]}", "message")
     db.commit()
-    return {"chat_id": conversation.id, "message": {"id": message.id, "body": message.body, "sender_id": user.id,
-            "created_at": message.created_at.isoformat()}}
+    msg_data = {"id": message.id, "conversation_id": conversation.id, "body": message.body, "sender_id": user.id,
+                "created_at": message.created_at.isoformat()}
+    sync_broadcast_to_user(other_user_id, {"type": "chat_message", "message": msg_data})
+    return {"chat_id": conversation.id, "message": msg_data}
 
 
 @app.get("/api/chats/with/{other_user_id}")
@@ -1326,6 +1874,152 @@ def friends(user: User = Depends(current_user), db: Session = Depends(get_db)):
     return {"friends": [{"id": person.id, "full_name": person.full_name, "college": person.college} for person in people]}
 
 
+@app.get("/api/friends/status/{other_user_id}")
+def friend_status(other_user_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    if other_user_id == user.id:
+        return {"status": "self", "request_id": None}
+    low, high = sorted((user.id, other_user_id))
+    if db.query(Friendship).filter_by(user_low=low, user_high=high).first():
+        return {"status": "friends", "request_id": None}
+
+    outgoing = db.query(FriendRequest).filter_by(sender_id=user.id, receiver_id=other_user_id, status="pending").first()
+    if outgoing:
+        return {"status": "request_sent", "request_id": outgoing.id}
+
+    incoming = db.query(FriendRequest).filter_by(sender_id=other_user_id, receiver_id=user.id, status="pending").first()
+    if incoming:
+        return {"status": "request_received", "request_id": incoming.id}
+
+    return {"status": "none", "request_id": None}
+
+
+@app.post("/api/friends/request/{other_user_id}")
+def send_friend_request(other_user_id: str, exchange_id: str | None = None,
+                        user: User = Depends(current_user), db: Session = Depends(get_db)):
+    if other_user_id == user.id:
+        raise HTTPException(400, "You cannot send a friend request to yourself")
+    target = db.get(User, other_user_id)
+    if not target:
+        raise HTTPException(404, "Student not found")
+
+    if db.query(Block).filter(
+        or_(
+            and_(Block.blocker_id == user.id, Block.blocked_id == other_user_id),
+            and_(Block.blocker_id == other_user_id, Block.blocked_id == user.id),
+        )
+    ).first():
+        raise HTTPException(403, "Cannot send friend request to this student")
+
+    low, high = sorted((user.id, other_user_id))
+    if db.query(Friendship).filter_by(user_low=low, user_high=high).first():
+        raise HTTPException(409, "You are already friends with this student")
+
+    existing_outgoing = db.query(FriendRequest).filter_by(
+        sender_id=user.id, receiver_id=other_user_id, status="pending"
+    ).first()
+    if existing_outgoing:
+        raise HTTPException(409, "Friend request already sent and pending")
+
+    existing_incoming = db.query(FriendRequest).filter_by(
+        sender_id=other_user_id, receiver_id=user.id, status="pending"
+    ).first()
+    if existing_incoming:
+        raise HTTPException(409, "This student has already sent you a friend request. Accept their request instead.")
+
+    req = FriendRequest(
+        id=new_id(),
+        sender_id=user.id,
+        receiver_id=other_user_id,
+        exchange_id=exchange_id,
+        status="pending",
+        created_at=now_utc(),
+    )
+    db.add(req)
+    notify(db, other_user_id, "New friend request", f"{user.full_name} sent you a friend request.", "friend_request")
+    db.commit()
+
+    sync_broadcast_to_user(other_user_id, {
+        "type": "friend_status_update",
+        "other_user_id": user.id,
+        "status": "request_received",
+        "request_id": req.id,
+    })
+
+    return {"status": "request_sent", "request_id": req.id}
+
+
+@app.post("/api/friends/requests/{request_id}/accept")
+def accept_friend_request(request_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    req = db.get(FriendRequest, request_id)
+    if not req or req.receiver_id != user.id:
+        raise HTTPException(404, "Friend request not found")
+    if req.status != "pending":
+        raise HTTPException(409, f"Friend request is already {req.status}")
+
+    req.status = "accepted"
+    req.responded_at = now_utc()
+
+    low, high = sorted((req.sender_id, req.receiver_id))
+    if not db.query(Friendship).filter_by(user_low=low, user_high=high).first():
+        db.add(Friendship(id=new_id(), user_low=low, user_high=high, created_at=now_utc()))
+
+    notify(db, req.sender_id, "Friend request accepted", f"{user.full_name} accepted your friend request!", "friend_accepted")
+    db.commit()
+
+    sync_broadcast_to_user(req.sender_id, {
+        "type": "friend_status_update",
+        "other_user_id": user.id,
+        "status": "friends",
+        "request_id": None,
+    })
+
+    return {"status": "friends", "message": "Friend request accepted"}
+
+
+@app.post("/api/friends/requests/{request_id}/reject")
+def reject_friend_request(request_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    req = db.get(FriendRequest, request_id)
+    if not req or req.receiver_id != user.id:
+        raise HTTPException(404, "Friend request not found")
+    if req.status != "pending":
+        raise HTTPException(409, f"Friend request is already {req.status}")
+
+    req.status = "rejected"
+    req.responded_at = now_utc()
+    db.commit()
+
+    sync_broadcast_to_user(req.sender_id, {
+        "type": "friend_status_update",
+        "other_user_id": user.id,
+        "status": "none",
+        "request_id": None,
+    })
+
+    return {"status": "none", "message": "Friend request rejected"}
+
+
+@app.post("/api/friends/requests/{request_id}/cancel")
+def cancel_friend_request(request_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    req = db.get(FriendRequest, request_id)
+    if not req or req.sender_id != user.id:
+        raise HTTPException(404, "Friend request not found")
+    if req.status != "pending":
+        raise HTTPException(409, f"Friend request is already {req.status}")
+
+    req.status = "cancelled"
+    req.responded_at = now_utc()
+    db.commit()
+
+    sync_broadcast_to_user(req.receiver_id, {
+        "type": "friend_status_update",
+        "other_user_id": user.id,
+        "status": "none",
+        "request_id": None,
+    })
+
+    return {"status": "none", "message": "Friend request cancelled"}
+
+
 @app.get("/api/notifications")
 def notifications(user: User = Depends(current_user), db: Session = Depends(get_db)):
     rows = db.query(Notification).filter_by(user_id=user.id).order_by(Notification.created_at.desc()).limit(100).all()
@@ -1350,17 +2044,156 @@ def subscriptions(user: User = Depends(current_user), db: Session = Depends(get_
     db.commit()  # Persist expiry/cancellation normalization when loading the plan page.
     used, reserved = monthly_usage(db, user.id)
     limit = next(item["limit"] for item in plan_catalog() if item["id"] == plan)
-    return {"current_plan": plan, "usage": used, "reserved": reserved, "limit": limit,
-            "remaining": None if limit is None else max(0, limit - used - reserved),
-            "plans": list(plan_catalog()), "billing_configured": False,
-            "billing_status": "unavailable"}
+
+    active_qr = db.query(AdminQRCode).filter_by(is_active=True).first()
+    pending_req = db.query(SubscriptionRequest).filter_by(user_id=user.id, status="pending_review").first()
+    pending_info = None
+    if pending_req:
+        pending_info = {
+            "id": pending_req.id,
+            "plan": pending_req.plan,
+            "amount_paise": pending_req.amount_paise,
+            "utr": pending_req.utr,
+            "status": pending_req.status,
+            "review_target_at": pending_req.review_target_at.isoformat(),
+            "target_review_minutes": 20,
+            "submitted_at": pending_req.created_at.isoformat(),
+            "review_target_disclaimer": "Our admin team reviews payment requests within an estimated target of 20 minutes.",
+        }
+
+    return {
+        "current_plan": plan, "usage": used, "reserved": reserved, "limit": limit,
+        "remaining": None if limit is None else max(0, limit - used - reserved),
+        "plans": list(plan_catalog()),
+        "billing_configured": active_qr is not None,
+        "billing_status": "ready" if active_qr else "unavailable",
+        "qr_code": {
+            "upi_id": active_qr.upi_id,
+            "title": active_qr.title,
+            "image_url": "/api/subscriptions/qr-code",
+        } if active_qr else None,
+        "pending_request": pending_info,
+    }
+
+
+@app.get("/api/subscriptions/qr-code")
+def get_subscription_qr_image(db: Session = Depends(get_db)):
+    qr = db.query(AdminQRCode).filter_by(is_active=True).first()
+    if not qr or not qr.image_path:
+        raise HTTPException(404, "No active subscription QR code configured")
+    return storage_service.get_file_response(qr.image_path, settings.supabase_qr_bucket, qr.mime_type)
+
+
+@app.post("/api/subscriptions/payment-request")
+async def submit_subscription_payment(
+    plan: str = Form(...),
+    utr: str = Form(...),
+    proof: UploadFile = File(...),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    valid_plans = {item["id"]: item for item in plan_catalog() if item["id"] in ("plus", "membership", "pro")}
+    if plan not in valid_plans:
+        raise HTTPException(400, "Invalid subscription plan selected")
+
+    plan_meta = valid_plans[plan]
+    price_inr = plan_meta.get("price_inr")
+    if price_inr is None or price_inr <= 0:
+        raise HTTPException(400, f"Pricing for {plan} is not configured")
+    amount_paise = int(price_inr * 100)
+
+    # Validate UTR format
+    cleaned_utr = re.sub(r"[^A-Za-z0-9]", "", utr.strip())
+    if len(cleaned_utr) < 8 or len(cleaned_utr) > 32:
+        raise HTTPException(400, "Enter a valid UPI transaction ID (UTR, 8-32 alphanumeric characters)")
+
+    # Deduplicate UTR
+    if db.query(SubscriptionRequest).filter_by(utr=cleaned_utr).first():
+        raise HTTPException(409, "This UPI transaction ID has already been submitted for verification")
+
+    # Prevent duplicate pending request
+    if db.query(SubscriptionRequest).filter_by(user_id=user.id, status="pending_review").first():
+        raise HTTPException(409, "You already have a subscription request pending review")
+
+    # Read and validate proof image via storage service
+    file_bytes = await proof.read()
+    proof_path, mime_type, file_size = storage_service.upload_subscription_proof(file_bytes, proof.filename or "")
+
+    proof_id = new_id()
+    now = now_utc()
+    review_target = now + timedelta(minutes=20)
+
+    sub_req = SubscriptionRequest(
+        id=proof_id,
+        user_id=user.id,
+        plan=plan,
+        amount_paise=amount_paise,
+        utr=cleaned_utr,
+        proof_path=proof_path,
+        mime_type=mime_type,
+        file_size_bytes=file_size,
+        status="pending_review",
+        review_target_at=review_target,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(sub_req)
+    notify(
+        db,
+        user.id,
+        "Payment request submitted",
+        f"Your {plan.capitalize()} subscription request with UTR {cleaned_utr} was submitted for review.",
+        "subscription",
+    )
+    db.commit()
+
+    return {
+        "status": "pending_review",
+        "request_id": sub_req.id,
+        "plan": plan,
+        "amount_paise": amount_paise,
+        "utr": cleaned_utr,
+        "review_target_at": review_target.isoformat(),
+        "target_review_minutes": 20,
+        "message": "Payment request submitted. Our team reviews submissions within an estimated target of 20 minutes.",
+    }
+
+
+@app.get("/api/subscriptions/my-request")
+def get_my_subscription_request(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    req = db.query(SubscriptionRequest).filter_by(user_id=user.id).order_by(SubscriptionRequest.created_at.desc()).first()
+    if not req:
+        return {"has_request": False, "request": None}
+    return {
+        "has_request": True,
+        "request": {
+            "id": req.id,
+            "plan": req.plan,
+            "amount_paise": req.amount_paise,
+            "utr": req.utr,
+            "status": req.status,
+            "review_target_at": req.review_target_at.isoformat(),
+            "target_review_minutes": 20,
+            "rejection_reason": req.rejection_reason,
+            "submitted_at": req.created_at.isoformat(),
+            "review_target_disclaimer": "Our team reviews payment submissions within an estimated target of 20 minutes.",
+        },
+    }
+
+
+@app.get("/api/subscriptions/my-request/proof")
+def get_my_subscription_proof(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    req = db.query(SubscriptionRequest).filter_by(user_id=user.id).order_by(SubscriptionRequest.created_at.desc()).first()
+    if not req or not req.proof_path:
+        raise HTTPException(404, "No subscription payment proof found for your account")
+    return storage_service.get_file_response(req.proof_path, settings.supabase_subscription_bucket, req.mime_type)
 
 
 @app.post("/api/subscriptions/{plan}/checkout")
 def subscription_checkout(plan: str, user: User = Depends(current_user)):
-    if plan not in ("plus", "pro"):
+    if plan not in ("plus", "membership", "pro"):
         raise HTTPException(400, "Choose Plus or Pro")
-    raise HTTPException(503, "Subscription billing is not configured. No plan has been activated.")
+    raise HTTPException(503, "Use the manual UPI QR checkout to submit your subscription payment.")
 
 
 @app.get("/api/points")
@@ -1561,6 +2394,56 @@ def help_content():
         {"title": "Never share your UPI PIN", "body": "ONPay and other students never need your UPI PIN, password, or banking credentials."},
         {"title": "Payment status", "body": "A payment app returning to ONPay is not proof of settlement. Keep the reference and use in-app support if status is pending."},
     ]}
+
+
+@app.websocket("/api/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    session_token = websocket.cookies.get(COOKIE_NAME)
+    if not session_token:
+        session_token = websocket.query_params.get("token")
+    if not session_token:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    session_hash = hash_value(session_token)
+    db = SessionLocal()
+    try:
+        session = db.query(LoginSession).filter_by(token_hash=session_hash).first()
+        if not session or session.expires_at <= now_utc():
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        user = db.get(User, session.user_id)
+        if not user:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        user_id = user.id
+    finally:
+        db.close()
+
+    await websocket.accept()
+    if user_id not in ws_connections:
+        ws_connections[user_id] = set()
+    ws_connections[user_id].add(websocket)
+
+    try:
+        await websocket.send_json({"type": "connected", "user_id": user_id})
+        while True:
+            data = await websocket.receive_text()
+            try:
+                msg = json.loads(data)
+                if msg.get("type") == "ping":
+                    await websocket.send_json({"type": "pong"})
+            except Exception:
+                pass
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        if user_id in ws_connections:
+            ws_connections[user_id].discard(websocket)
+            if not ws_connections[user_id]:
+                del ws_connections[user_id]
 
 
 # Keep CORS outside FastAPI's error middleware so even unhandled 500 responses

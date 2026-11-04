@@ -72,6 +72,14 @@ The API catalog is Free ₹0 / up to 5, Plus ₹199 per month / up to 20, and Pr
 
 ## Migration and verification
 
-Run `alembic upgrade head` from the directory containing the active backend `.env` before starting/deploying the API. Migration `0003_receiver_confirmation_pro` adds nullable receiver-confirmation audit fields and renames stored `premium` plan values to `pro`, preserving existing rows. `create_all()` at API startup creates missing tables but does not apply schema upgrades to existing tables.
+Before deploying backend code that uses recipient-confirmation fields, take a database backup and run the migration against the same database configured for the backend. In the Render service shell (with the service's `DATABASE_URL` available), from the backend working directory (normally `backend/`), run:
+
+```sh
+python -m alembic current
+python -m alembic upgrade head
+python -m alembic current
+```
+
+Confirm the final revision is `0003_receiver_confirmation_pro` before restarting/deploying the backend. This migration adds nullable receipt-audit fields and renames stored `premium` plan labels to `pro` without deleting exchange/payment rows. Existing payment rows remain valid with null receipt fields. Do not rely on `create_all()` at API startup: it creates missing tables but does not upgrade existing tables. Deploy the backend only after the migration succeeds; then rebuild/deploy the frontend.
 
 Run the backend with `python -m unittest discover -s tests -v`. From `frontend/`, run `npm test` and `npm run build`. Real Mailjet delivery, GPS permissions, location provider calls, camera devices, UPI apps, subscription billing, and real-money settlement require external configuration and device-level validation.

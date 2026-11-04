@@ -14,7 +14,7 @@ from app.config import settings
 from app.database import Base, SessionLocal, engine
 from app.main import (
     accept_listing, confirm_cash, confirm_payment_received, create_listing, create_payment, get_exchange, get_exchange_for_user,
-    payment_returned, reconcile_payment, request_otp, update_arrival, verify_otp,
+    payment_returned, reconcile_payment, request_otp, transactions, update_arrival, verify_otp,
 )
 from app.main import subscription_checkout, youpi_webhook
 from app.models import Exchange, Friendship, Listing, PaymentAttempt, PointLedger, StatusEvent, Subscription, User
@@ -105,8 +105,14 @@ class DomainFlowTests(unittest.TestCase):
             availability="Today after 2 PM", note="Can meet near the entrance",
         ), self.provider, self.db)
 
-        exchange_data = accept_listing(request["id"], AcceptListing(amount=50000), self.provider, self.db)["exchange"]
+        match_result = accept_listing(request["id"], AcceptListing(amount=50000), self.provider, self.db)
+        exchange_data = match_result["exchange"]
+        self.assertFalse(match_result["duplicate"])
         exchange_id = exchange_data["id"]
+        recovered_match = accept_listing(request["id"], AcceptListing(amount=50000), self.provider, self.db)
+        self.assertTrue(recovered_match["duplicate"])
+        self.assertEqual(recovered_match["exchange"]["id"], exchange_id)
+        self.assertEqual(self.db.query(Exchange).filter_by(id=exchange_id).count(), 1)
         with self.assertRaises(HTTPException) as denied:
             get_exchange_for_user(self.db, exchange_id, "someone-else")
         self.assertEqual(denied.exception.status_code, 404)
@@ -225,6 +231,23 @@ class DomainFlowTests(unittest.TestCase):
         completed = self.db.get(Exchange, exchange_id)
         self.assertEqual(completed.status, "receiver_confirmed")
         self.assertIsNotNone(completed.completed_at)
+
+    def test_activity_filters_refresh_after_recipient_confirmation_and_handover(self):
+        exchange_id, payment_id = self._pending_payment(both_cash_confirmed=False)
+        before = transactions("in_transit", 0, 30, self.requester, self.db)["transactions"]
+        self.assertEqual(before[0]["id"], exchange_id)
+        self.assertEqual(before[0]["payment_status"], "verification_pending")
+
+        confirm_payment_received(payment_id, self.provider, self.db)
+        recipient_confirmed = transactions("in_transit", 0, 30, self.requester, self.db)["transactions"]
+        self.assertEqual(recipient_confirmed[0]["status"], "verification_pending")
+        self.assertEqual(recipient_confirmed[0]["payment_status"], "receiver_confirmed")
+
+        confirm_cash(exchange_id, CashConfirmation(handed_over=True), self.provider, self.db)
+        self.assertEqual(transactions("in_transit", 0, 30, self.requester, self.db)["transactions"], [])
+        completed = transactions("success", 0, 30, self.requester, self.db)["transactions"]
+        self.assertEqual(completed[0]["status"], "receiver_confirmed")
+        self.assertEqual(completed[0]["payment_status"], "receiver_confirmed")
 
     def test_experimental_provider_event_does_not_erase_receiver_confirmation(self):
         exchange_id, payment_id = self._pending_payment()
