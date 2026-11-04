@@ -25,7 +25,7 @@ export const App: React.FC = () => {
     try {
       setLoading(true)
       const res = await api.getMe()
-      setAdmin(res.admin)
+        setAdmin(res)
       // Quick fetch of pending subscriptions count for badge
       try {
         const subs = await api.getSubscriptions('PENDING', 1, 1)

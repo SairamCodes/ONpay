@@ -177,11 +177,9 @@ export const api = {
     }
     return data
   },
-
-  async getMe(): Promise<{ admin: AdminUser }> {
-    return adminFetch('/api/admin/auth/me')
-  },
-
+async getMe(): Promise<AdminUser> {
+  return adminFetch('/api/admin/auth/me')
+},
   async logout(): Promise<void> {
     try {
       await adminFetch('/api/admin/auth/logout', { method: 'POST' })
