@@ -26,7 +26,8 @@ export const DashboardPage: React.FC = () => {
   if (error) return <div className="form-error">{error}</div>
   if (!data) return null
 
-  const { stats, trends_14d } = data
+ const stats = data
+const trends_14d = data.trend_14d
 
   return (
     <div>

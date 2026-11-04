@@ -23,10 +23,8 @@ export interface DailyTrendItem {
   volume: number
   completed_tx: number
 }
-
-export interface AnalyticsResponse {
-  stats: KPIStats
-  trends_14d: DailyTrendItem[]
+export interface AnalyticsResponse extends KPIStats {
+  trend_14d: DailyTrendItem[]
 }
 
 export interface UserSummary {
