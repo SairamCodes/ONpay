@@ -20,8 +20,8 @@ export interface DailyTrendItem {
   date: string
   logins: number
   unique_users: number
-  volume: number
-  completed_tx: number
+  volume?: number
+  completed_tx?: number
 }
 export interface AnalyticsResponse extends KPIStats {
   trend_14d: DailyTrendItem[]

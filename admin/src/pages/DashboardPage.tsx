@@ -93,8 +93,8 @@ const trends_14d = data.trend_14d
                   <td>
                     <span className="pill pill-neutral">{row.unique_users} DAU</span>
                   </td>
-                  <td>{row.completed_tx}</td>
-                  <td><strong>₹{row.volume.toLocaleString()}</strong></td>
+                 <td>{row.completed_tx ?? 0}</td>
+                    <td><strong>₹{(row.volume ?? 0).toLocaleString('en-IN')}</strong></td>
                 </tr>
               ))}
             </tbody>
